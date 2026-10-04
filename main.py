@@ -6,7 +6,32 @@ from PySide6.QtWidgets import QApplication
 from app.main_window import MainWindow
 
 
+def ocr_selftest(pdf_path: str, report_path: str) -> int:
+    """exe 안에 OCR 모델이 제대로 들어갔는지 확인한다 (화면 없이 실행, 결과를 파일로 남김).
+
+    PdfPriceEditor.exe --ocr-selftest 입력.pdf 결과.txt
+    """
+    import time
+    import traceback
+
+    try:
+        import pymupdf
+        from core.ocr import models_available, ocr_page
+        t = time.time()
+        words = ocr_page(pymupdf.open(pdf_path)[0])
+        lines = [f"models_available={models_available()}", f"words={len(words)}",
+                 f"seconds={time.time() - t:.1f}"] + [w.text for w in words]
+        code = 0 if words else 1
+    except Exception:  # noqa: BLE001
+        lines, code = ["ERROR", traceback.format_exc()], 2
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return code
+
+
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--ocr-selftest":
+        return ocr_selftest(sys.argv[2], sys.argv[3])
     app = QApplication(sys.argv)
     app.setApplicationName("PDF 가격 수정기")
     app.setStyle("Fusion")

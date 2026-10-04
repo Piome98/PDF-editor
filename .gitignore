@@ -13,3 +13,6 @@ venv/
 # 프로그램이 만드는 결과 파일
 *_수정본.pdf
 *_변경내역.csv
+
+# OCR 모델 (tools/fetch_models.py로 받음, 약 24MB)
+models/

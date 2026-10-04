@@ -5,7 +5,7 @@ import os
 import pymupdf
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QProgressDialog,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
                                QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
@@ -15,7 +15,9 @@ from core.engine import (RegionResult, apply, check_template, compute, number_ta
                          verify, write_log)
 from core.models import ERASE, ERASE_ALL, ERASE_PICK, VALUE, Region, Template
 from core.numbers import detect_style
+from core.ocr import models_available, needs_ocr
 
+from .ocr_job import OcrJob
 from .pdf_view import MODE_ERASE, MODE_SELECT, MODE_VALUE, PdfView
 
 APP_TITLE = "PDF 가격 수정기"
@@ -34,6 +36,8 @@ class MainWindow(QMainWindow):
         self.inputs: dict[str, str] = {}             # 영역 id → 이 문서에서 입력한 새 값
         self.results: dict[str, RegionResult] = {}
         self.preview_doc: pymupdf.Document | None = None
+        self.ocr: dict[int, list] = {}               # 쪽 번호 → OCR로 읽은 단어 (이미지 PDF)
+        self._ocr_job: OcrJob | None = None
         self.page_no = 0
         self.last_dir = os.path.expanduser("~")
         self._syncing = False
@@ -108,6 +112,9 @@ class MainWindow(QMainWindow):
         self.preview_action = act("결과 미리보기", self.toggle_preview, "F5",
                                   "수정 결과를 미리 보기 (다시 누르면 원본)", checkable=True)
         act("결과 PDF 저장", self.export_pdf, "Ctrl+S")
+        tb.addSeparator()
+        act("글자 인식(OCR)", self.run_ocr_all, tip="모든 쪽을 OCR로 다시 읽기 "
+            "(글자가 깨져 읽히거나, 일부만 이미지인 PDF에 사용)")
 
     def _build_side_panel(self) -> None:
         self.side = QWidget()
@@ -278,16 +285,15 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, APP_TITLE, f"PDF를 열 수 없습니다.\n{e}")
             return
+        self._cancel_ocr()
         self.doc, self.doc_path = doc, path
+        self.ocr = {}
         self.last_dir = os.path.dirname(path)
         self.inputs = {}
         self.page_no = 0
         if not self.template.regions:
             self.template.page_sizes = page_sizes(doc)
         self.messages.clear()
-        if not any(p.get_text("text").strip() for p in doc):
-            self.add_message("이 PDF에는 글자 정보가 없습니다(스캔 이미지). 원본 값을 읽을 수 없으니 "
-                             "모든 숫자 영역에 새 값을 직접 입력해야 합니다.", WARN_COLOR)
         rotated = [str(i + 1) for i, p in enumerate(doc) if p.rotation]
         if rotated:
             self.add_message(f"회전된 쪽({', '.join(rotated)}쪽)은 영역 위치가 어긋날 수 있습니다. "
@@ -296,6 +302,69 @@ class MainWindow(QMainWindow):
         self.recompute()
         self.update_title()
         QTimer.singleShot(0, self.view.fit_width)
+        image_pages = [i for i in range(len(doc)) if needs_ocr(doc[i])]
+        if image_pages:
+            QTimer.singleShot(50, lambda: self.start_ocr(image_pages, auto=True))
+
+    # ───────────────────────── OCR ─────────────────────────
+    def start_ocr(self, pages: list[int], auto: bool = False) -> None:
+        if not self.doc or not pages:
+            return
+        if not models_available():
+            QMessageBox.warning(self, APP_TITLE, "OCR 모델 파일이 없어 이미지 PDF의 글자를 읽을 수 없습니다.\n"
+                                "개발 환경이라면 tools/fetch_models.py를 먼저 실행하세요.")
+            return
+        self._cancel_ocr()
+        if auto:
+            self.add_message(f"이미지로 된 PDF입니다({len(pages)}쪽). OCR로 글자를 읽습니다. "
+                             "인식이 불확실한 글자는 '영역 안 글자' 목록에 ⚠로 표시됩니다.", WARN_COLOR)
+        job = OcrJob(self.doc, pages, self)
+        dlg = QProgressDialog("글자를 인식하는 중입니다 (한 쪽에 10초 정도)...", "취소", 0, len(pages), self)
+        dlg.setWindowTitle(APP_TITLE)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.canceled.connect(job.cancel)
+        job.progress.connect(lambda done, total: (dlg.setValue(done),
+                                                  dlg.setLabelText(f"글자를 인식하는 중입니다... ({done}/{total}쪽)")))
+        job.failed.connect(lambda msg: self.add_message("✖ " + msg, ERR_COLOR))
+
+        def on_page(page_no: int, words: list) -> None:
+            if self._ocr_job is job:
+                self.ocr[page_no] = words
+
+        def on_finished(completed: bool) -> None:
+            dlg.close()
+            if self._ocr_job is not job:
+                return
+            self._ocr_job = None
+            done = len(job.results)
+            if completed:
+                low = sum(1 for ws in job.results.values() for w in ws if w.score < 0.8)
+                msg = f"OCR 완료: {done}쪽에서 단어 {sum(len(ws) for ws in job.results.values())}개를 읽었습니다."
+                if low:
+                    msg += f" 그중 {low}개는 인식이 불확실합니다."
+                self.add_message(msg, OK_COLOR)
+            else:
+                self.add_message(f"OCR이 중단되었습니다 ({done}/{len(pages)}쪽만 읽음).", WARN_COLOR)
+            self.run_template_check()
+            ids = self.view.selected_ids()
+            self.recompute()
+            self.load_props(self.template.region(ids[0]) if ids else None)
+
+        job.pageDone.connect(on_page)
+        job.finished.connect(on_finished)
+        self._ocr_job = job
+        job.start()
+
+    def _cancel_ocr(self) -> None:
+        if self._ocr_job is not None:
+            self._ocr_job.cancel()
+            self._ocr_job = None
+
+    def run_ocr_all(self) -> None:
+        if self.doc:
+            self.start_ocr(list(range(len(self.doc))))
 
     def new_template(self) -> None:
         if self.template.regions and QMessageBox.question(
@@ -358,14 +427,41 @@ class MainWindow(QMainWindow):
         if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(self.doc_path)):
             QMessageBox.warning(self, APP_TITLE, "원본 파일에 덮어쓸 수 없습니다. 다른 이름을 지정하세요.")
             return
-        out = apply(self.doc, self.template, self.results)
-        checks = verify(out, self.template, self.results)
+        out = apply(self.doc, self.template, self.results, self.ocr)
         try:
             out.save(path, garbage=3, deflate=True)
-            log_path = os.path.splitext(path)[0] + "_변경내역.csv"
-            write_log(log_path, self.template, self.results, checks)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, APP_TITLE, f"저장하지 못했습니다.\n{e}")
+            return
+        if not self.ocr:
+            self._finish_export(path, out, None)
+            return
+        # 이미지 PDF는 결과를 다시 OCR해서 검증한다
+        job = OcrJob(out, sorted(self.ocr), self)
+        dlg = QProgressDialog("저장한 PDF를 다시 읽어 검증하는 중입니다...", "", 0, len(self.ocr), self)
+        dlg.setCancelButton(None)
+        dlg.setWindowTitle(APP_TITLE)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        job.progress.connect(lambda done, _total: dlg.setValue(done))
+        job.failed.connect(lambda msg: self.add_message("✖ " + msg, ERR_COLOR))
+
+        def finished(_completed: bool) -> None:
+            dlg.close()
+            self._finish_export(path, out, job.results)
+            self._verify_job = None
+
+        job.finished.connect(finished)
+        self._verify_job = job
+        job.start()
+
+    def _finish_export(self, path: str, out: pymupdf.Document, ocr_out: dict | None) -> None:
+        checks = verify(out, self.template, self.results, ocr_out)
+        log_path = os.path.splitext(path)[0] + "_변경내역.csv"
+        try:
+            write_log(log_path, self.template, self.results, checks)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, APP_TITLE, f"변경 내역을 저장하지 못했습니다.\n{e}")
             return
 
         self.messages.clear()
@@ -386,7 +482,7 @@ class MainWindow(QMainWindow):
     # ───────────────────────── 계산과 표시 ─────────────────────────
     def run_template_check(self) -> None:
         if self.doc and self.template.regions:
-            for w in check_template(self.doc, self.template):
+            for w in check_template(self.doc, self.template, self.ocr):
                 self.add_message("⚠ " + w, WARN_COLOR)
 
     def add_message(self, text: str, color: QColor) -> None:
@@ -395,7 +491,7 @@ class MainWindow(QMainWindow):
         self.messages.addItem(item)
 
     def recompute(self) -> None:
-        self.results = compute(self.doc, self.template, self.inputs) if self.doc else {}
+        self.results = compute(self.doc, self.template, self.inputs, self.ocr) if self.doc else {}
         self.preview_doc = None
         self.fill_table()
         self.render_page()
@@ -478,7 +574,7 @@ class MainWindow(QMainWindow):
         src = self.doc
         if preview:
             if self.preview_doc is None:
-                self.preview_doc = apply(self.doc, self.template, self.results)
+                self.preview_doc = apply(self.doc, self.template, self.results, self.ocr)
             src = self.preview_doc
         page = src[self.page_no]
         scale = self.view.zoom * self.devicePixelRatioF()
@@ -520,7 +616,7 @@ class MainWindow(QMainWindow):
     def on_region_drawn(self, kind: str, rect: list[float]) -> None:
         if not self.doc:
             return
-        info = read_region(self.doc[self.page_no], rect)
+        info = read_region(self.doc[self.page_no], rect, self.ocr.get(self.page_no))
         region = Region(page=self.page_no, rect=rect, kind=kind, sample_text=info.text)
         if kind == ERASE:
             region.name = self.template.next_name("삭제")
@@ -563,7 +659,7 @@ class MainWindow(QMainWindow):
 
     def on_region_moved(self, region: Region) -> None:
         if self.doc and region.page < len(self.doc):
-            region.sample_text = read_region(self.doc[region.page], region.rect).text
+            region.sample_text = read_region(self.doc[region.page], region.rect, self.ocr.get(region.page)).text
         self.recompute()
 
     def delete_selected(self) -> None:
@@ -694,7 +790,8 @@ class MainWindow(QMainWindow):
         elif not words:
             self.p_words_label.setText("영역 안에서 읽은 글자가 없습니다 (이미지·스캔이거나 빈 칸).")
         elif pick:
-            self.p_words_label.setText("체크한 글자만 지웁니다. PDF 위의 글자를 눌러도 바뀝니다.\n"
+            self.p_words_label.setText(("[OCR로 읽은 글자] " if words[0].ocr else "") +
+                                       "체크한 글자만 지웁니다. PDF 위의 글자를 눌러도 바뀝니다.\n"
                                        "같은 글자는 다른 문서에서도 같은 규칙으로 처리됩니다.")
         elif region.kind == ERASE:
             self.p_words_label.setText("영역 전체를 덮습니다. 일부만 지우려면 '글자 골라 지우기'를 선택하세요.")
@@ -706,7 +803,8 @@ class MainWindow(QMainWindow):
         for i, (w, (state, desc)) in enumerate(zip(words, states)):
             prefix = f"{w.line + 1}줄  " if w.line != line else "      "
             line = w.line
-            item = QListWidgetItem(f"{prefix}{w.text}    — {desc}")
+            warn = f"   ⚠ 인식 불확실({w.score:.2f}) — 원본과 맞는지 확인" if w.ocr and w.score < 0.8 else ""
+            item = QListWidgetItem(f"{prefix}{w.text}    — {desc}{warn}")
             item.setData(Qt.UserRole, i)
             item.setForeground(QBrush({"erase": ERR_COLOR, "keep": OK_COLOR}.get(state, QColor("#0B5CD5"))))
             if state == "erase":
@@ -780,7 +878,8 @@ class MainWindow(QMainWindow):
             region.kind = new_kind
             if new_kind == ERASE:
                 res = self.results.get(region.id)
-                info = res.original if res else read_region(self.doc[region.page], region.rect)
+                info = res.original if res else read_region(self.doc[region.page], region.rect,
+                                                            self.ocr.get(region.page))
                 self._default_erase_mode(region, info)
             else:
                 region.fill = ""

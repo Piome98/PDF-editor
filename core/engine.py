@@ -11,6 +11,9 @@ import pymupdf
 from .formula import FormulaError, evaluate, expand_wildcards, is_valid_name
 from .models import ERASE, ERASE_PICK, VALUE, Region, Template
 from .numbers import format_number, parse_number
+from .words import Word, order_words, words_in_rect
+
+OcrMap = dict[int, list[Word]]   # 쪽 번호 → OCR로 읽은 단어 (OCR한 쪽만 들어 있음)
 
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\malgun.ttf",
@@ -21,16 +24,6 @@ FONT_ALIAS = "pricefont"
 
 
 # ───────────────────────── 읽기 ─────────────────────────
-
-@dataclass
-class Word:
-    text: str
-    bbox: tuple[float, float, float, float]
-    size: float
-    color: tuple[float, float, float]
-    baseline: float
-    line: int = 0          # 영역 안에서 몇 번째 줄인지 (위에서부터 0)
-
 
 @dataclass
 class TextInfo:
@@ -87,20 +80,12 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
             flush()
 
     # PDF 내부 순서가 아니라 화면에 보이는 위치 순서로 정렬
-    words.sort(key=lambda w: (w.bbox[1] + w.bbox[3]) / 2)
-    line_no, line_y = -1, None
-    for w in words:
-        yc, h = (w.bbox[1] + w.bbox[3]) / 2, w.bbox[3] - w.bbox[1]
-        if line_y is None or abs(yc - line_y) > max(h, 1) * 0.5:
-            line_no += 1
-            line_y = yc
-        w.line = line_no
-    words.sort(key=lambda w: (w.line, w.bbox[0]))
-    return words
+    return order_words(words)
 
 
-def read_region(page: pymupdf.Page, rect) -> TextInfo:
-    words = read_words(page, rect)
+def read_region(page: pymupdf.Page, rect, ocr_words: list[Word] | None = None) -> TextInfo:
+    """영역 안의 글자를 읽는다. ocr_words가 있으면(이미지 PDF) 텍스트 레이어 대신 OCR 결과를 쓴다."""
+    words = words_in_rect(ocr_words, rect) if ocr_words is not None else read_words(page, rect)
     if not words:
         return TextInfo()
     box = pymupdf.Rect(words[0].bbox)
@@ -149,7 +134,7 @@ class RegionResult:
         return [w for w, e in zip(self.original.words, self.erase_flags) if not e]
 
 
-def check_template(doc: pymupdf.Document, tpl: Template) -> list[str]:
+def check_template(doc: pymupdf.Document, tpl: Template, ocr: OcrMap | None = None) -> list[str]:
     """템플릿을 이 PDF에 적용해도 되는지 점검하고 경고 목록을 돌려준다."""
     warnings = []
     sizes = page_sizes(doc)
@@ -165,7 +150,7 @@ def check_template(doc: pymupdf.Document, tpl: Template) -> list[str]:
         if r.page >= len(doc):
             warnings.append(f"'{r.name}' 영역이 PDF에 없는 {r.page + 1}쪽에 있습니다")
             continue
-        info = read_region(doc[r.page], r.rect)
+        info = read_region(doc[r.page], r.rect, (ocr or {}).get(r.page))
         if r.sample_text and not info.text:
             warnings.append(f"'{r.name}' 영역에 텍스트가 없습니다 (템플릿 작성 시: '{r.sample_text}')")
         elif r.kind == ERASE and r.erase_mode == ERASE_PICK:
@@ -177,13 +162,14 @@ def check_template(doc: pymupdf.Document, tpl: Template) -> list[str]:
     return warnings
 
 
-def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str]) -> dict[str, RegionResult]:
+def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str],
+            ocr: OcrMap | None = None) -> dict[str, RegionResult]:
     """각 영역의 새 값을 계산한다. inputs는 {영역 id: 사용자가 입력한 값}."""
     results: dict[str, RegionResult] = {}
     for r in tpl.regions:
         res = RegionResult(r.id)
         if r.page < len(doc):
-            res.original = read_region(doc[r.page], r.rect)
+            res.original = read_region(doc[r.page], r.rect, (ocr or {}).get(r.page))
             res.target = number_target(r, res.original.words)
             if r.kind == ERASE:
                 res.erase_flags = [r.should_erase(w.text) for w in res.original.words]
@@ -281,21 +267,33 @@ def hex_to_rgb(h: str) -> tuple[float, float, float]:
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
 
 
-def redact_rects(r: Region, res: RegionResult) -> list[pymupdf.Rect]:
-    """실제로 지울 사각형들. 단어 단위로 지울 때는 옆 단어를 건드리지 않게 살짝 안쪽으로 줄인다."""
-    def word_rect(w: Word) -> pymupdf.Rect:
-        return pymupdf.Rect(w.bbox) + (0.2, 0, -0.2, 0)
+def redact_rects(r: Region, res: RegionResult, image_page: bool = False
+                 ) -> list[tuple[pymupdf.Rect, tuple[float, float, float] | None]]:
+    """실제로 지울 (사각형, 채울 색) 목록.
 
+    - 텍스트 레이어 단어: 옆 단어를 건드리지 않게 살짝 안쪽으로 줄이고, 색을 따로 정하지 않았으면 채우지 않는다.
+    - OCR 단어(이미지): 글자 가장자리 번짐까지 지우도록 살짝 키우고, 원래 배경색으로 채운다.
+    """
+    user_fill = hex_to_rgb(r.fill) if r.fill else None
+
+    def word_item(w: Word):
+        if w.ocr:
+            return pymupdf.Rect(w.bbox) + (-0.6, -0.6, 0.6, 0.6), user_fill or w.bg or (1, 1, 1)
+        return pymupdf.Rect(w.bbox) + (0.2, 0, -0.2, 0), user_fill
+
+    # 이미지 위에서는 채우지 않으면 원래 글자가 그대로 보이므로 흰색으로 덮는다
+    whole = (pymupdf.Rect(r.rect), user_fill or ((1, 1, 1) if image_page else None))
     if r.kind == ERASE:
         if r.erase_mode == ERASE_PICK:
-            return [word_rect(w) for w, e in zip(res.original.words, res.erase_flags) if e]
-        return [pymupdf.Rect(r.rect)]
+            return [word_item(w) for w, e in zip(res.original.words, res.erase_flags) if e]
+        return [whole]
     if res.target is not None:
-        return [word_rect(res.original.words[res.target])]
-    return [pymupdf.Rect(r.rect)]
+        return [word_item(res.original.words[res.target])]
+    return [whole]
 
 
-def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]) -> pymupdf.Document:
+def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult],
+          ocr: OcrMap | None = None) -> pymupdf.Document:
     """원본은 건드리지 않고, 수정된 새 문서를 만들어 돌려준다."""
     out = pymupdf.open("pdf", doc.tobytes())
     font_path = find_font(tpl.font_file)
@@ -308,13 +306,15 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
         if not regions:
             continue
         page = out[page_no]
+        image_page = page_no in (ocr or {})
         for r in regions:
-            fill = hex_to_rgb(r.fill) if r.fill else None
-            for rect in redact_rects(r, results[r.id]):
+            for rect, fill in redact_rects(r, results[r.id], image_page):
                 page.add_redact_annot(rect, fill=fill, cross_out=False)
-        # 표 테두리 같은 선과 이미지는 남기고 글자만 지운다 (덮을 색을 지정한 영역은 그 색으로 덮임)
-        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE,
-                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+        # 표 테두리 같은 선은 남긴다. 이미지 PDF는 지울 자리의 이미지 픽셀까지 실제로 지운다
+        # (덮기만 하면 PDF 안에 원래 글자 이미지가 그대로 남아 개인정보가 새어 나갈 수 있음)
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_PIXELS if image_page else pymupdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
         if font_path:
             page.insert_font(fontname=FONT_ALIAS, fontfile=font_path)
         for r in regions:
@@ -382,15 +382,20 @@ class Check:
     message: str
 
 
-def verify(out: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]) -> list[Check]:
-    """결과 PDF를 다시 읽어 각 영역이 의도대로 바뀌었는지 확인한다."""
+def verify(out: pymupdf.Document, tpl: Template, results: dict[str, RegionResult],
+           ocr_out: OcrMap | None = None) -> list[Check]:
+    """결과 PDF를 다시 읽어 각 영역이 의도대로 바뀌었는지 확인한다.
+
+    이미지 PDF는 결과 PDF를 다시 OCR한 단어(ocr_out)로 확인한다.
+    """
     checks = []
     for r in tpl.regions:
         res = results.get(r.id)
         if res is None or res.error or r.page >= len(out):
             checks.append(Check(r.id, False, res.error if res else "결과 없음"))
             continue
-        actual = read_region(out[r.page], r.rect).text
+        ocr_words = (ocr_out or {}).get(r.page)
+        actual = read_region(out[r.page], r.rect, ocr_words).text
         expected = expected_text(r, res)
         ok = _norm(actual) == _norm(expected)
         if ok:
@@ -403,6 +408,8 @@ def verify(out: pymupdf.Document, tpl: Template, results: dict[str, RegionResult
                 msg = "변경됨"
         else:
             msg = f"예상 '{expected}', 실제 '{actual}'"
+            if ocr_words is not None:
+                msg = "OCR로 다시 읽은 결과가 다름 — 미리보기로 직접 확인하세요. " + msg
         checks.append(Check(r.id, ok, msg))
     return checks
 

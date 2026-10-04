@@ -1,0 +1,40 @@
+"""PDF 텍스트 레이어와 OCR이 공통으로 쓰는 '단어' 자료형."""
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+
+import pymupdf
+
+
+@dataclass
+class Word:
+    text: str
+    bbox: tuple[float, float, float, float]
+    size: float
+    color: tuple[float, float, float]
+    baseline: float
+    line: int = 0                                    # 영역 안에서 몇 번째 줄인지 (위에서부터 0)
+    bg: tuple[float, float, float] | None = None     # OCR 단어: 글자 뒤 배경색 (지울 때 이 색으로 채움)
+    score: float = 1.0                               # OCR 인식 신뢰도 (텍스트 레이어는 1.0)
+    ocr: bool = False
+
+
+def order_words(words: list[Word]) -> list[Word]:
+    """화면에 보이는 위치 기준으로 줄을 나누고 위→아래, 왼→오른쪽 순서로 정렬한다."""
+    words = sorted(words, key=lambda w: (w.bbox[1] + w.bbox[3]) / 2)
+    line_no, line_y = -1, None
+    for w in words:
+        yc, h = (w.bbox[1] + w.bbox[3]) / 2, w.bbox[3] - w.bbox[1]
+        if line_y is None or abs(yc - line_y) > max(h, 1) * 0.5:
+            line_no += 1
+            line_y = yc
+        w.line = line_no
+    return sorted(words, key=lambda w: (w.line, w.bbox[0]))
+
+
+def words_in_rect(words: list[Word], rect) -> list[Word]:
+    """영역 안에 중심이 들어오는 단어만 골라 (복사본으로) 정렬해 돌려준다."""
+    r = pymupdf.Rect(rect)
+    inside = [replace(w) for w in words
+              if r.contains(pymupdf.Point((w.bbox[0] + w.bbox[2]) / 2, (w.bbox[1] + w.bbox[3]) / 2))]
+    return order_words(inside)
