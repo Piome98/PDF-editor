@@ -2,26 +2,20 @@
 from __future__ import annotations
 
 import csv
-import os
+import math
 from dataclasses import dataclass, field
 from decimal import Decimal
 
 import pymupdf
 
+from . import fonts
+from .fonts import TextStyle
 from .formula import FormulaError, evaluate, expand_wildcards, is_valid_name
 from .models import ERASE, ERASE_PICK, VALUE, Region, Template
 from .numbers import format_number, parse_number
 from .words import Word, order_words, words_in_rect
 
 OcrMap = dict[int, list[Word]]   # 쪽 번호 → OCR로 읽은 단어 (OCR한 쪽만 들어 있음)
-
-FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\malgun.ttf",
-    r"C:\Windows\Fonts\NanumGothic.ttf",
-    r"C:\Windows\Fonts\gulim.ttc",
-]
-FONT_ALIAS = "pricefont"
-
 
 # ───────────────────────── 읽기 ─────────────────────────
 
@@ -59,7 +53,8 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
                 nonlocal cur
                 if cur and cur["chars"]:
                     words.append(Word("".join(cur["chars"]), tuple(cur["bbox"]), cur["size"],
-                                      cur["color"], cur["baseline"]))
+                                      cur["color"], cur["baseline"], font=cur["font"],
+                                      bold=bool(cur["flags"] & 16), italic=bool(cur["flags"] & 2)))
                 cur = None
 
             for span in line.get("spans", []):
@@ -74,7 +69,8 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
                         flush()
                     if cur is None:
                         cur = {"chars": [], "bbox": pymupdf.Rect(bb), "size": span["size"],
-                               "color": _rgb(span["color"]), "baseline": ch["origin"][1]}
+                               "color": _rgb(span["color"]), "baseline": ch["origin"][1],
+                               "font": span["font"], "flags": span["flags"]}
                     cur["chars"].append(ch["c"])
                     cur["bbox"] |= bb
             flush()
@@ -122,6 +118,7 @@ class RegionResult:
     error: str = ""
     target: int | None = None                           # 숫자 영역: 교체할 단어 번호
     erase_flags: list[bool] = field(default_factory=list)  # 지우기 영역: 단어별 지움 여부
+    style: TextStyle | None = None                      # 숫자 영역: 새 글자를 쓸 글꼴·크기·색
 
     @property
     def base_text(self) -> str:
@@ -233,6 +230,8 @@ def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str],
         user_set = bool(r.formula.strip() or inputs.get(r.id, "").strip())
         res.new_text = format_number(res.value, r.decimals, r.thousands, r.prefix, r.suffix)
         res.changed = user_set and _norm(res.new_text) != _norm(res.base_text)
+        if res.changed:
+            res.style = region_style(doc, r, res, ocr)
     return results
 
 
@@ -255,11 +254,20 @@ def expected_text(r: Region, res: RegionResult) -> str:
 
 # ───────────────────────── 쓰기 ─────────────────────────
 
-def find_font(preferred: str = "") -> str | None:
-    for path in [preferred, *FONT_CANDIDATES]:
-        if path and os.path.exists(path):
-            return path
-    return None
+def region_style(doc: pymupdf.Document, r: Region, res: RegionResult, ocr: OcrMap | None = None) -> TextStyle:
+    """숫자 영역의 새 글자를 원본과 같게 쓰기 위한 글꼴·크기·색. 사용자가 정한 값이 있으면 그걸 쓴다."""
+    words = res.original.words
+    ref = words[res.target] if res.target is not None else (words[0] if words else None)
+    if ref is None:          # 빈 칸에 새로 쓰는 경우
+        face = fonts.find_face(fonts.FALLBACK_FONT)
+        rect = pymupdf.Rect(r.rect)
+        style = TextStyle(face.label if face else "Helvetica", round(rect.height * 0.6, 1), (0, 0, 0),
+                          "fallback", face=face)
+    elif ref.ocr:
+        style = fonts.ocr_style(words, ref, (ocr or {}).get(r.page))
+    else:
+        style = fonts.text_layer_style(doc, doc[r.page], ref, res.new_text or ref.text)
+    return fonts.apply_overrides(style, r.font, r.font_size, r.color)
 
 
 def hex_to_rgb(h: str) -> tuple[float, float, float]:
@@ -296,9 +304,6 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
           ocr: OcrMap | None = None) -> pymupdf.Document:
     """원본은 건드리지 않고, 수정된 새 문서를 만들어 돌려준다."""
     out = pymupdf.open("pdf", doc.tobytes())
-    font_path = find_font(tpl.font_file)
-    font = pymupdf.Font(fontfile=font_path) if font_path else pymupdf.Font("helv")
-
     for page_no in range(len(out)):
         regions = [r for r in tpl.regions
                    if r.page == page_no and results.get(r.id) and results[r.id].changed
@@ -315,24 +320,24 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
         page.apply_redactions(
             images=pymupdf.PDF_REDACT_IMAGE_PIXELS if image_page else pymupdf.PDF_REDACT_IMAGE_NONE,
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
-        if font_path:
-            page.insert_font(fontname=FONT_ALIAS, fontfile=font_path)
         for r in regions:
             if r.kind == VALUE:
-                _draw_value(page, r, results[r.id], font, FONT_ALIAS if font_path else "helv")
+                res = results[r.id]
+                style = res.style or region_style(doc, r, res, ocr)
+                _draw_value(page, r, res, style)
+    try:
+        out.subset_fonts()       # 넣은 글꼴에서 실제 쓴 글자만 남겨 파일 크기를 줄인다
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
-def _draw_value(page: pymupdf.Page, r: Region, res: RegionResult, font: pymupdf.Font, fontname: str):
+def _bounds(r: Region, res: RegionResult, size: float) -> tuple[float, float]:
+    """새 글자를 쓸 수 있는 가로 범위: 영역 안이면서, 같은 줄에 남겨 둔 글자(라벨·단위)와 겹치지 않는 곳."""
     rect = pymupdf.Rect(r.rect)
-    pad = 1.0
-    target = res.original.words[res.target] if res.target is not None else None
-    src_size = target.size if target else res.original.size
-    size = r.font_size or src_size or rect.height * 0.7
-
-    # 쓸 수 있는 가로 범위: 영역 안이면서, 같은 줄에 남겨 둔 글자(라벨·단위)와 겹치지 않는 곳
-    left, right = rect.x0 + pad, rect.x1 - pad
-    if target:
+    left, right = rect.x0 + 1, rect.x1 - 1
+    if res.target is not None:
+        target = res.original.words[res.target]
         gap = size * 0.25
         for w in res.original.words:
             if w is target or w.line != target.line:
@@ -341,36 +346,91 @@ def _draw_value(page: pymupdf.Page, r: Region, res: RegionResult, font: pymupdf.
                 left = max(left, w.bbox[2] + gap)
             elif w.bbox[0] >= target.bbox[2]:
                 right = min(right, w.bbox[0] - gap)
+    return left, right
 
-    width = font.text_length(res.new_text, fontsize=size)
+
+def _anchor(r: Region, res: RegionResult, left: float, right: float) -> pymupdf.Rect:
+    if res.target is not None:
+        return pymupdf.Rect(res.original.words[res.target].bbox)
+    if res.original.bbox:
+        return pymupdf.Rect(res.original.bbox)
+    rect = pymupdf.Rect(r.rect)
+    return pymupdf.Rect(left, rect.y0, right, rect.y1)
+
+
+def _place(align: str, anchor: pymupdf.Rect, x0: float, x1: float, left: float, right: float) -> float:
+    """글자 범위 [x0, x1] (원점 기준 상대 위치)를 원래 글자 자리에 맞추는 원점 x."""
+    if align == "left":
+        x = anchor.x0 - x0
+    elif align == "center":
+        x = (anchor.x0 + anchor.x1) / 2 - (x0 + x1) / 2
+    else:
+        x = anchor.x1 - x1
+    return min(max(x, left - x0), right - x1)
+
+
+def _draw_value(page: pymupdf.Page, r: Region, res: RegionResult, style: TextStyle) -> None:
+    rect = pymupdf.Rect(r.rect)
+    target = res.original.words[res.target] if res.target is not None else None
+    size = style.size or rect.height * 0.7
+    left, right = _bounds(r, res, size)
+    anchor = _anchor(r, res, left, right)
+    baseline = target.baseline if target else res.original.baseline
+    text = res.new_text
+
+    if style.raster_dpi and style.face is not None:
+        # 이미지 PDF: 원본과 같은 해상도의 그림으로 넣어 글자 번짐 정도까지 맞춘다
+        png, (w, h), (ox, oy), (ink0, ink1) = fonts.text_png(text, style.face, size, style.color, style.raster_dpi)
+        if ink1 - ink0 > right - left:
+            size *= (right - left) / max(ink1 - ink0, 0.01)
+            png, (w, h), (ox, oy), (ink0, ink1) = fonts.text_png(text, style.face, size, style.color,
+                                                                 style.raster_dpi)
+        if style.origin is not None and style.old_advance:
+            # 원래 글자의 시작점·글자 폭을 기준으로 정렬 (표 칸 정렬 방식과 같음)
+            new_adv = fonts.advance(style.face, size, text)
+            ox0, y = style.origin
+            if r.align == "left":
+                x = ox0
+            elif r.align == "center":
+                x = ox0 + (style.old_advance - new_adv) / 2
+            else:
+                x = ox0 + style.old_advance - new_adv
+            x = min(max(x, left - ink0), right - ink1)
+        else:
+            x = _place(r.align, anchor, ink0, ink1, left, right)
+            y = baseline if baseline is not None else rect.y0 + (rect.height + size * 0.7) / 2
+        x0, y0 = x - ox, y - oy
+        if style.raster_grid is not None:
+            # 넣는 그림의 픽셀을 원본 이미지의 픽셀 격자에 맞추고, 남는 소수점은 그림 안에서 글자를 밀어 보정
+            step = 72 / style.raster_dpi
+            gx, gy = style.raster_grid
+            sx0 = gx + math.floor((x0 - gx) / step) * step
+            sy0 = gy + math.floor((y0 - gy) / step) * step
+            shift = ((x0 - sx0) / step, (y0 - sy0) / step)
+            png, (w, h), (ox, oy), _ = fonts.text_png(text, style.face, size, style.color, style.raster_dpi, shift)
+            x0, y0 = sx0, sy0
+        page.insert_image(pymupdf.Rect(x0, y0, x0 + w, y0 + h), stream=png)
+        return
+
+    # 텍스트 PDF: 원본 글꼴(또는 같은 이름의 설치 글꼴)로 글자를 쓴다
+    buf = style.font_buffer or (fonts.face_bytes(style.face) if style.face else None)
+    if buf:
+        font = pymupdf.Font(fontbuffer=buf)
+        fontname = "pf" + format(abs(hash((style.font_label, len(buf)))) % 10 ** 8, "d")
+        page.insert_font(fontname=fontname, fontbuffer=buf)
+    else:
+        font, fontname = pymupdf.Font("helv"), "helv"
+    width = font.text_length(text, fontsize=size)
     if width > right - left:                  # 칸에 안 들어가면 글자를 줄인다
         size *= (right - left) / max(width, 0.01)
-        width = font.text_length(res.new_text, fontsize=size)
-
-    # 원본 글자가 있던 자리에 맞춰 정렬하면 옆 칸과 줄이 어긋나지 않는다
-    if target:
-        anchor = pymupdf.Rect(target.bbox)
-    elif res.original.bbox:
-        anchor = pymupdf.Rect(res.original.bbox)
-    else:
-        anchor = pymupdf.Rect(left, rect.y0, right, rect.y1)
-    if r.align == "left":
-        x = anchor.x0
-    elif r.align == "center":
-        x = (anchor.x0 + anchor.x1 - width) / 2
-    else:
-        x = anchor.x1 - width
-    x = min(max(x, left), right - width)
-
-    baseline = target.baseline if target else res.original.baseline
-    if baseline is not None and not r.font_size:
+        width = font.text_length(text, fontsize=size)
+    x = _place(r.align, anchor, 0, width, left, right)
+    if baseline is not None:
         y = baseline
     else:
         asc, desc = font.ascender, font.descender
         y = rect.y0 + (rect.height - (asc - desc) * size) / 2 + asc * size
-    src_color = target.color if target else res.original.color
-    color = hex_to_rgb(r.color) if r.color else (src_color or (0, 0, 0))
-    page.insert_text((x, y), res.new_text, fontsize=size, fontname=fontname, color=color)
+    page.insert_text((x, y), text, fontsize=size, fontname=fontname, color=style.color)
 
 
 # ───────────────────────── 검증 ─────────────────────────

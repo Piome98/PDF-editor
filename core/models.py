@@ -26,6 +26,7 @@ class Region:
     prefix: str = ""
     suffix: str = ""
     align: str = "right"         # left | center | right
+    font: str = ""               # "" = 원본 글꼴 자동 감지, 아니면 설치된 글꼴 이름 (예: 바탕)
     font_size: float = 0         # 0 = 원본 글자 크기 자동 감지
     color: str = ""              # "" = 원본 색 자동 감지, 아니면 "#RRGGBB"
     fill: str = ""               # "" = 배경 유지(글자만 제거), 아니면 "#RRGGBB"로 덮음
@@ -60,7 +61,7 @@ class Template:
     name: str = "새 템플릿"
     page_sizes: list[list[float]] = field(default_factory=list)  # [[w, h], ...]
     regions: list[Region] = field(default_factory=list)
-    font_file: str = ""          # 비어 있으면 맑은 고딕 등 시스템 한글 글꼴 사용
+    font_file: str = ""          # (예전 버전 호환용, 사용하지 않음 — 영역별 font 사용)
 
     def to_json(self) -> str:
         data = {"version": TEMPLATE_VERSION, **asdict(self)}

@@ -1,7 +1,9 @@
 """PDF 텍스트 레이어와 OCR이 공통으로 쓰는 '단어' 자료형."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+
+import numpy as np
 
 import pymupdf
 
@@ -17,6 +19,17 @@ class Word:
     bg: tuple[float, float, float] | None = None     # OCR 단어: 글자 뒤 배경색 (지울 때 이 색으로 채움)
     score: float = 1.0                               # OCR 인식 신뢰도 (텍스트 레이어는 1.0)
     ocr: bool = False
+    # 텍스트 레이어 단어: PDF에 적힌 글꼴 이름(예: ArialMT)과 굵기/기울임
+    font: str = ""
+    bold: bool = False
+    italic: bool = False
+    # OCR 단어: 글꼴·색 추정용 원본 글자 그림 (잉크 마스크, 컬러 픽셀)과 해상도
+    patch: np.ndarray | None = field(default=None, repr=False, compare=False)
+    patch_rgb: np.ndarray | None = field(default=None, repr=False, compare=False)
+    px_scale: float = 0.0                            # OCR 그림의 1pt당 픽셀 수
+    patch_xy: tuple[float, float] = (0.0, 0.0)       # patch_rgb 왼쪽 위 모서리의 PDF 좌표
+    src_grid: tuple[float, float] = (0.0, 0.0)       # 원본 이미지의 왼쪽 위 PDF 좌표 (픽셀 격자 맞춤용)
+    src_dpi: float = 0.0                             # 원본 이미지의 해상도
 
 
 def order_words(words: list[Word]) -> list[Word]:

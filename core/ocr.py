@@ -33,6 +33,8 @@ _HANGUL_BELOW_BASELINE = 0.08     # 한글 받침 획은 기준선보다 조금 
 # 글자 사이 빈 간격 ÷ 글자 높이: 이 이상이면 띄어쓰기로 본다.
 # (실측: 단어 안 최대 0.34, 실제 띄어쓰기 최소 0.45)  OCR이 띄어쓰기를 찾은 곳은 더 작은 간격도 인정
 _SPACE_GAP = 0.40
+_NUMERIC = set("0123456789,.")
+_PATCH_MARGIN = 3                 # 글꼴·색 추정용 글자 그림에 남길 여백 (번진 가장자리 포함)
 _SPACE_GAP_WITH_HINT = 0.22
 
 _engine = None
@@ -88,13 +90,25 @@ class PageImage:
     rgb: np.ndarray
     scale: float
     to_page: pymupdf.Matrix     # 그림 픽셀 좌표 → PDF 좌표
+    src_dpi: float = 0.0        # 페이지에 들어 있는 원본 이미지의 해상도
+    src_grid: tuple[float, float] = (0.0, 0.0)   # 그 이미지의 왼쪽 위 PDF 좌표
 
 
 def render_for_ocr(page: pymupdf.Page, dpi: int = DPI) -> PageImage:
     scale = dpi / 72
     pix = page.get_pixmap(dpi=dpi, alpha=False)
     rgb = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
-    return PageImage(rgb, scale, pymupdf.Matrix(1 / scale, 1 / scale) * page.derotation_matrix)
+    # 가장 큰 이미지의 해상도 = 원본 문서를 그림으로 만들 때의 해상도
+    src_dpi, src_grid = 0.0, (0.0, 0.0)
+    images = [i for i in page.get_image_info() if i.get("width")]
+    if images:
+        big = max(images, key=lambda i: abs(pymupdf.Rect(i["bbox"])))
+        box = pymupdf.Rect(big["bbox"])
+        if box.width > 0:
+            src_dpi = big["width"] / (box.width / 72)
+            src_grid = (box.x0, box.y0)
+    return PageImage(rgb, scale, pymupdf.Matrix(1 / scale, 1 / scale) * page.derotation_matrix,
+                     src_dpi, src_grid)
 
 
 def ocr_image(img: PageImage) -> list[Word]:
@@ -113,6 +127,8 @@ def ocr_image(img: PageImage) -> list[Word]:
     words: list[Word] = []
     for box, txt, score, chars in zip(res.boxes, res.txts, res.scores, res.word_results):
         words += _split_line(np.asarray(box), txt, float(score), chars, img.rgb, ink_all, img.scale, img.to_page)
+    for w in words:
+        w.src_dpi, w.src_grid = img.src_dpi, img.src_grid
     return words
 
 
@@ -188,7 +204,11 @@ def _split_line(box, txt, score, chars, rgb, ink_all, scale, to_page) -> list[Wo
         if segments:
             gap = a - segments[-1][1]
             hinted = bool(hints and idxs and hints[idxs[0]])
-            if gap < ink_h * _SPACE_GAP and not hinted:
+            # 숫자 사이(1 | ,234,000)는 간격이 넓어도 나누지 않는다 — 숫자 일부만 바뀌는 사고 방지
+            left_c = chars[seg_idx[-1][-1]][0][-1:] if seg_idx[-1] else ""
+            right_c = chars[idxs[0]][0][:1] if idxs else ""
+            numeric = bool(left_c and right_c and left_c in _NUMERIC and right_c in _NUMERIC)
+            if numeric or (gap < ink_h * _SPACE_GAP and not hinted):
                 segments[-1][1] = b
                 seg_idx[-1] += idxs
                 continue
@@ -225,6 +245,11 @@ def _split_line(box, txt, score, chars, rgb, ink_all, scale, to_page) -> list[Wo
         baseline = (pymupdf.Point(px0, y0 + base_row) * to_page).y
         if hangul:
             baseline -= size * _HANGUL_BELOW_BASELINE
+        m = _PATCH_MARGIN
+        qx0, qy0 = max(px0 - m, 0), max(py0 - m, 0)
+        qx1, qy1 = min(px1 + m, rgb.shape[1]), min(py1 + m, rgb.shape[0])
         words.append(Word(text, tuple(rect), round(size, 1), color, baseline,
-                          bg=bg, score=round(min(scores), 2), ocr=True))
+                          bg=bg, score=round(min(scores), 2), ocr=True,
+                          patch=ink_all[qy0:qy1, qx0:qx1].copy(), patch_rgb=rgb[qy0:qy1, qx0:qx1].copy(),
+                          px_scale=scale, patch_xy=tuple(pymupdf.Point(qx0, qy0) * to_page)))
     return words

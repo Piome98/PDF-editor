@@ -20,7 +20,12 @@ def ocr_selftest(pdf_path: str, report_path: str) -> int:
         t = time.time()
         words = ocr_page(pymupdf.open(pdf_path)[0])
         lines = [f"models_available={models_available()}", f"words={len(words)}",
-                 f"seconds={time.time() - t:.1f}"] + [w.text for w in words]
+                 f"seconds={time.time() - t:.1f}"]
+        if words:   # 글꼴·크기·색 추정까지 exe 안에서 동작하는지
+            from core.fonts import ocr_style
+            target = max(words, key=lambda w: len(w.text))
+            lines.append("style=" + ocr_style([target], target, words).describe())
+        lines += [w.text for w in words]
         code = 0 if words else 1
     except Exception:  # noqa: BLE001
         lines, code = ["ERROR", traceback.format_exc()], 2

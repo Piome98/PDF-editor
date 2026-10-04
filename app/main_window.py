@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 
 import pymupdf
@@ -12,7 +13,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComb
                                QToolBar, QVBoxLayout, QWidget)
 
 from core.engine import (RegionResult, apply, check_template, compute, number_target, page_sizes, read_region,
+                         region_style,
                          verify, write_log)
+from core.fonts import font_choices
 from core.models import ERASE, ERASE_ALL, ERASE_PICK, VALUE, Region, Template
 from core.numbers import detect_style
 from core.ocr import models_available, needs_ocr
@@ -172,6 +175,18 @@ class MainWindow(QMainWindow):
         self.p_size.setRange(0, 72)
         self.p_size.setDecimals(1)
         self.p_size.setSpecialValueText("자동 (원본과 같게)")
+        # 글꼴·글자색 (비우면 원본에서 자동 감지)
+        self.p_style_label = QLabel()
+        self.p_style_label.setWordWrap(True)
+        self.p_style_label.setStyleSheet("color:#57606A")
+        self.p_font = QComboBox()
+        self.p_font.addItem("자동 (원본과 같게)", "")
+        self.p_font.setMaxVisibleItems(20)
+        self._fonts_loaded = False
+        self.p_color_btn = QPushButton()
+        self.p_color_btn.setToolTip("새 글자의 색을 직접 정합니다")
+        self.p_color_auto = QPushButton("자동")
+        self.p_color_auto.setToolTip("원본 글자색을 그대로 씁니다")
         self.p_fill = QComboBox()
         self.p_fill_btn = QPushButton("색…")
         self.p_fill_btn.setFixedWidth(40)
@@ -192,6 +207,10 @@ class MainWindow(QMainWindow):
         align_row = QHBoxLayout()
         align_row.addWidget(self.p_align)
         align_row.addWidget(self.p_size)
+        font_row = QHBoxLayout()
+        font_row.addWidget(self.p_font, 1)
+        font_row.addWidget(self.p_color_btn)
+        font_row.addWidget(self.p_color_auto)
 
         # 영역 안에서 읽어 낸 텍스트
         self.p_words = QListWidget()
@@ -223,12 +242,15 @@ class MainWindow(QMainWindow):
         form.addRow("다른 문서에서", self.p_unknown)
         form.addRow("", self.p_number_only)
         form.addRow(self._formula_label, self.p_formula)
-        self.p_fmt_row_widget, self.p_align_row_widget = QWidget(), QWidget()
-        for w, row in ((self.p_fmt_row_widget, fmt_row), (self.p_align_row_widget, align_row)):
+        self.p_fmt_row_widget, self.p_align_row_widget, self.p_font_row_widget = QWidget(), QWidget(), QWidget()
+        for w, row in ((self.p_fmt_row_widget, fmt_row), (self.p_align_row_widget, align_row),
+                       (self.p_font_row_widget, font_row)):
             row.setContentsMargins(0, 0, 0, 0)
             w.setLayout(row)
         form.addRow(self._fmt_label, self.p_fmt_row_widget)
         form.addRow(self._align_label, self.p_align_row_widget)
+        form.addRow("원본 서식", self.p_style_label)
+        form.addRow("글꼴 / 글자색", self.p_font_row_widget)
         form.addRow("배경 처리", fill_row)
         form.addRow("영역 안 글자", self._words_widget)
         self.form = form
@@ -243,6 +265,9 @@ class MainWindow(QMainWindow):
         self.p_size.valueChanged.connect(self.on_props_edited)
         self.p_thousands.toggled.connect(self.on_props_edited)
         self.p_fill_btn.clicked.connect(self.pick_fill_color)
+        self.p_font.currentIndexChanged.connect(self.on_props_edited)
+        self.p_color_btn.clicked.connect(self.pick_text_color)
+        self.p_color_auto.clicked.connect(self.reset_text_color)
         self.props.setEnabled(False)
 
         lay.addWidget(QLabel("<b>확인 메시지</b>"))
@@ -743,10 +768,19 @@ class MainWindow(QMainWindow):
             self.p_thousands.setChecked(region.thousands)
             self.p_align.setCurrentIndex(self.p_align.findData(region.align))
             self.p_size.setValue(region.font_size)
+            if region.kind == VALUE:
+                self._load_font_choices()
+                idx = self.p_font.findData(region.font)
+                if idx < 0 and region.font:          # 이 PC에 없는 글꼴이 지정된 템플릿
+                    self.p_font.addItem(f"{region.font} (설치 안 됨)", region.font)
+                    idx = self.p_font.count() - 1
+                self.p_font.setCurrentIndex(max(idx, 0))
+                self._show_style(region)
             self._set_fill_options(region.fill)
             is_value = region.kind == VALUE
             pick = region.kind == ERASE and region.erase_mode == ERASE_PICK
-            for w in (self.p_number_only, self.p_formula, self.p_fmt_row_widget, self.p_align_row_widget):
+            for w in (self.p_number_only, self.p_formula, self.p_fmt_row_widget, self.p_align_row_widget,
+                      self.p_style_label, self.p_font_row_widget):
                 self.form.setRowVisible(w, is_value)
             self.form.setRowVisible(self.p_erase_mode, not is_value)
             self.form.setRowVisible(self.p_unknown, pick)
@@ -869,7 +903,7 @@ class MainWindow(QMainWindow):
         if self._syncing or region is None:
             return
         fields_ = ("name", "kind", "formula", "prefix", "suffix", "decimals", "thousands", "align",
-                   "font_size", "fill", "erase_mode", "unknown_action", "number_only")
+                   "font_size", "fill", "erase_mode", "unknown_action", "number_only", "font")
         before = tuple(getattr(region, f) for f in fields_)
         region.name = self.p_name.text().strip() or region.name
         new_kind = self.p_kind.currentData()
@@ -896,7 +930,66 @@ class MainWindow(QMainWindow):
         region.thousands = self.p_thousands.isChecked()
         region.align = self.p_align.currentData()
         region.font_size = self.p_size.value()
+        if region.kind == VALUE and self._fonts_loaded:
+            region.font = self.p_font.currentData() or ""
         if tuple(getattr(region, f) for f in fields_) != before:
+            QTimer.singleShot(0, self._after_edit)
+
+    # ── 글꼴·글자색 ──
+    def _load_font_choices(self) -> None:
+        if self._fonts_loaded:
+            return
+        self.statusBar().showMessage("설치된 글꼴 목록을 읽는 중...")
+        QGuiApplication.processEvents()
+        for label in font_choices():
+            self.p_font.addItem(label, label)
+        self._fonts_loaded = True
+        self.statusBar().clearMessage()
+
+    def _detected_style(self, region: Region):
+        """사용자 지정값을 빼고, 원본에서 자동으로 알아낸 서식."""
+        res = self.results.get(region.id)
+        if not self.doc or not res or res.error or region.kind != VALUE or not res.original.words:
+            return None
+        probe = dataclasses.replace(region, font="", font_size=0, color="")
+        try:
+            return region_style(self.doc, probe, res, self.ocr)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _show_style(self, region: Region) -> None:
+        style = self._detected_style(region)
+        if style is None:
+            self.p_style_label.setText("영역 안 글자를 읽으면 원본의 글꼴·크기·색이 표시됩니다.")
+        else:
+            self.p_style_label.setText("감지: " + style.describe())
+        if region.color:
+            swatch, text = region.color, "직접 지정"
+        elif style is not None:
+            swatch, text = "#%02X%02X%02X" % tuple(round(c * 255) for c in style.color), "원본색"
+        else:
+            swatch, text = "#000000", "원본색"
+        light = QColor(swatch).lightness() > 140
+        self.p_color_btn.setText(f"■ {text}")
+        self.p_color_btn.setStyleSheet(f"color:{swatch}; font-weight:bold;"
+                                       + ("background:#555;" if light else ""))
+        self.p_color_auto.setEnabled(bool(region.color))
+
+    def pick_text_color(self) -> None:
+        region = getattr(self, "_current", None)
+        if region is None or region.kind != VALUE:
+            return
+        style = self._detected_style(region)
+        start = region.color or ("#%02X%02X%02X" % tuple(round(c * 255) for c in style.color) if style else "#000000")
+        c = QColorDialog.getColor(QColor(start), self, "새 글자색 선택")
+        if c.isValid():
+            region.color = c.name().upper()
+            QTimer.singleShot(0, self._after_edit)
+
+    def reset_text_color(self) -> None:
+        region = getattr(self, "_current", None)
+        if region is not None and region.color:
+            region.color = ""
             QTimer.singleShot(0, self._after_edit)
 
     def pick_fill_color(self) -> None:
