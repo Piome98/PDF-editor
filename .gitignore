@@ -1,0 +1,15 @@
+# 빌드 결과물 (exe는 GitHub Releases에 따로 올림)
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 프로그램이 만드는 결과 파일
+*_수정본.pdf
+*_변경내역.csv
