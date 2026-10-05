@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 
 import pymupdf
 from PySide6.QtCore import QRectF, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QProgressDialog,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
                                QToolBar, QVBoxLayout, QWidget)
 
@@ -17,16 +18,18 @@ from core.engine import (RegionResult, apply, bulk_report, check_template, compu
                          page_sizes, read_region, region_style, word_style, write_bulk_report,
                          verify, write_log)
 from core.fonts import font_choices
-from core.models import ERASE, ERASE_ALL, ERASE_PICK, LIST, VALUE, Region, Template
+from core.models import ERASE, ERASE_ALL, ERASE_PICK, LIST, NUMBER, TEXT, VALUE, Region, Template
 from core.numbers import detect_style
 from core.ocr import models_available, needs_ocr
 
 from .bulk_dialogs import BulkReportDialog, ExcelImportDialog
 from .ocr_job import OcrJob
-from .pdf_view import MODE_ERASE, MODE_LIST, MODE_SELECT, MODE_VALUE, PdfView
+from .pdf_view import PdfView
 
 APP_TITLE = "PDF 가격 수정기"
 COL_PAGE, COL_KIND, COL_NAME, COL_ORIG, COL_INPUT, COL_RESULT, COL_STATUS = range(7)
+# 금액·수량처럼 생긴 단어 (₩1,234 / 1,234원 / -12.5 / 12%)
+_AMOUNT = re.compile(r"[₩$△▲\-(]?\d[\d,]*(\.\d+)?\)?(원|%|개|EA|ea)?")
 OK_COLOR, WARN_COLOR, ERR_COLOR = QColor("#1A7F37"), QColor("#9A6700"), QColor("#CF222E")
 
 
@@ -66,8 +69,8 @@ class MainWindow(QMainWindow):
         self.view.zoomChanged.connect(lambda _: self.render_page())
         self.view.filesDropped.connect(self.on_files_dropped)
         self.view.tokenClicked.connect(self.on_token_clicked)
+        self.view.regionMenu.connect(self.on_region_menu)
         self.update_title()
-        self.set_mode(MODE_SELECT)
         self.statusBar().showMessage("PDF를 열거나 창에 끌어다 놓으세요. 템플릿(.json)도 끌어다 놓을 수 있습니다.")
 
     # ───────────────────────── UI 구성 ─────────────────────────
@@ -94,17 +97,11 @@ class MainWindow(QMainWindow):
         act("템플릿 저장", self.save_template, "Ctrl+Shift+S", tip="영역 설정을 템플릿(.json)으로 저장")
         tb.addSeparator()
 
-        self.mode_group = QActionGroup(self)
-        self.mode_actions = {}
-        for mode, text, key, tip in [
-            (MODE_SELECT, "선택/이동", "V", "영역을 선택하고 옮기거나, 오른쪽 아래 모서리를 끌어 크기 조절"),
-            (MODE_VALUE, "＋ 숫자 영역", "N", "드래그해서 새 숫자로 바꿀 영역 지정"),
-            (MODE_ERASE, "＋ 지울 영역", "E", "드래그해서 지울 영역 지정"),
-            (MODE_LIST, "＋ 품번 대조 영역", "L", "드래그해서 엑셀 품번과 대조할 표(목록) 영역 지정"),
-        ]:
-            a = act(text, lambda _=False, m=mode: self.set_mode(m), key, tip, checkable=True)
-            self.mode_group.addAction(a)
-            self.mode_actions[mode] = a
+        self.draw_action = act("영역 선택", self.toggle_draw, "R",
+                               "켜져 있으면 PDF의 빈 곳을 드래그해 영역을 만듭니다.\n"
+                               "영역 클릭 = 선택, 끌기 = 이동, 오른쪽 아래 모서리 = 크기 조절, "
+                               "오른쪽 클릭 = 영역 해제·종류 바꾸기", checkable=True)
+        self.draw_action.setChecked(True)
         tb.addSeparator()
 
         act("◀", lambda: self.goto_page(self.page_no - 1), "PgUp", "이전 쪽")
@@ -157,9 +154,16 @@ class MainWindow(QMainWindow):
         form = QFormLayout(self.props)
         self.p_name = QLineEdit()
         self.p_kind = QComboBox()
-        self.p_kind.addItem("숫자 변경", VALUE)
+        self.p_kind.addItem("내용 바꾸기", VALUE)
         self.p_kind.addItem("지우기", ERASE)
-        self.p_kind.addItem("품번 대조 (엑셀)", LIST)
+        self.p_kind.addItem("엑셀 품번 대조", LIST)
+        self.p_target = QComboBox()
+        self.p_target.addItem("숫자 (수식·쉼표 등 숫자 표기 적용)", NUMBER)
+        self.p_target.addItem("텍스트 (입력한 글자 그대로)", TEXT)
+        self.p_hint = QLabel("PDF에서 바꾸거나 지울 곳의 <b>빈 곳을 드래그</b>해 영역을 만드세요.<br>"
+                             "영역을 클릭하면 여기서 설정하고, <b>오른쪽 클릭</b>하면 해제할 수 있습니다.")
+        self.p_hint.setWordWrap(True)
+        self.p_hint.setStyleSheet("color:#57606A; padding:6px 0")
         self.p_list_unmatched = QComboBox()
         self.p_list_unmatched.addItem("엑셀에 없는 품번 줄은 지우기", "erase")
         self.p_list_unmatched.addItem("표시만 하고 지우지 않기", "keep")
@@ -251,8 +255,10 @@ class MainWindow(QMainWindow):
         self._words_widget = QWidget()
         self._words_widget.setLayout(words_box)
 
+        form.addRow(self.p_hint)
         form.addRow("이름", self.p_name)
         form.addRow("종류", self.p_kind)
+        form.addRow("수정 대상", self.p_target)
         form.addRow("지우는 방식", self.p_erase_mode)
         form.addRow("다른 문서에서", self.p_unknown)
         form.addRow("엑셀에 없는 품번", self.p_list_unmatched)
@@ -275,7 +281,7 @@ class MainWindow(QMainWindow):
 
         for w in (self.p_name, self.p_formula, self.p_prefix, self.p_suffix):
             w.editingFinished.connect(self.on_props_edited)
-        for w in (self.p_kind, self.p_align, self.p_fill, self.p_erase_mode, self.p_unknown,
+        for w in (self.p_kind, self.p_target, self.p_align, self.p_fill, self.p_erase_mode, self.p_unknown,
                   self.p_list_unmatched, self.p_list_price):
             w.currentIndexChanged.connect(self.on_props_edited)
         self.p_number_only.toggled.connect(self.on_props_edited)
@@ -287,6 +293,7 @@ class MainWindow(QMainWindow):
         self.p_color_btn.clicked.connect(self.pick_text_color)
         self.p_color_auto.clicked.connect(self.reset_text_color)
         self.props.setEnabled(False)
+        self._show_rows(None)
 
         lay.addWidget(QLabel("<b>확인 메시지</b>"))
         self.messages = QListWidget()
@@ -437,7 +444,7 @@ class MainWindow(QMainWindow):
         self.add_message(f"엑셀 불러옴: {os.path.basename(path)} — 품번 {len(bulk.items)}개 (가격 {priced}개)",
                          OK_COLOR)
         if not any(r.kind == LIST for r in self.template.regions):
-            self.add_message("이제 '＋ 품번 대조 영역'(L)으로 PDF의 품목 표를 드래그하세요.", WARN_COLOR)
+            self.add_message("이제 PDF의 품목 표를 드래그하고, 영역을 오른쪽 클릭해 '엑셀 품번 대조'를 고르세요.", WARN_COLOR)
         ids = self.view.selected_ids()
         self.recompute()
         self.load_props(self.template.region(ids[0]) if ids else None)
@@ -463,7 +470,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, "먼저 '엑셀 품번 불러오기'로 엑셀을 불러오세요.")
             return
         if not any(r.kind == LIST for r in self.template.regions):
-            QMessageBox.information(self, APP_TITLE, "'＋ 품번 대조 영역'으로 PDF의 품목 표를 먼저 지정하세요.")
+            QMessageBox.information(self, APP_TITLE, "PDF의 품목 표를 드래그한 뒤 종류를 '엑셀 품번 대조'로 바꿔 주세요.")
             return
         base = os.path.splitext(self.doc_path)[0] if self.doc_path else os.path.join(self.last_dir, "대조결과")
         BulkReportDialog(bulk_report(self.template, self.results, self.bulk), base + "_엑셀대조.csv", self).exec()
@@ -630,7 +637,7 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(self.template.regions))
         for row, r in enumerate(self.template.regions):
             res = self.results.get(r.id)
-            editable_input = r.kind == VALUE and not r.formula.strip()
+            editable_input = r.kind == VALUE and (r.target == TEXT or not r.formula.strip())
             if r.kind == LIST:
                 if res and res.rows and not res.error:
                     sm = list_summary(res)
@@ -661,7 +668,8 @@ class MainWindow(QMainWindow):
             else:
                 status, color = "유지", QColor("#57606A")
             cells = [
-                (str(r.page + 1), False), ({ERASE: "지우기", LIST: "품번대조"}.get(r.kind, "숫자"), False),
+                (str(r.page + 1), False),
+                ({ERASE: "지우기", LIST: "품번대조"}.get(r.kind, "텍스트" if r.target == TEXT else "숫자"), False),
                 (r.name, True), (res.original.text if res else "", False),
                 (self.inputs.get(r.id, "") if editable_input else
                  ("=" + r.formula if r.formula else
@@ -717,19 +725,16 @@ class MainWindow(QMainWindow):
             self.render_page()
 
     def toggle_preview(self) -> None:
-        if self.preview_action.isChecked():
-            self.set_mode(MODE_SELECT)
-            self.preview_action.setText("원본 보기")
-        else:
-            self.preview_action.setText("결과 미리보기")
+        preview = self.preview_action.isChecked()
+        self.preview_action.setText("원본 보기" if preview else "결과 미리보기")
+        self.view.set_draw_enabled(self.draw_action.isChecked() and not preview)
         self.render_page()
 
-    def set_mode(self, mode: str) -> None:
-        if mode != MODE_SELECT and self.preview_action.isChecked():
+    def toggle_draw(self) -> None:
+        if self.draw_action.isChecked() and self.preview_action.isChecked():
             self.preview_action.setChecked(False)
             self.toggle_preview()
-        self.mode_actions[mode].setChecked(True)
-        self.view.set_mode(mode)
+        self.view.set_draw_enabled(self.draw_action.isChecked())
 
     def update_title(self) -> None:
         parts = [APP_TITLE]
@@ -741,32 +746,79 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(" — ".join(parts))
 
     # ───────────────────────── 영역 편집 ─────────────────────────
-    def on_region_drawn(self, kind: str, rect: list[float]) -> None:
+    def on_region_drawn(self, rect: list[float]) -> None:
         if not self.doc:
             return
         info = read_region(self.doc[self.page_no], rect, self.ocr.get(self.page_no))
-        region = Region(page=self.page_no, rect=rect, kind=kind, sample_text=info.text)
-        if kind == ERASE:
-            region.name = self.template.next_name("삭제")
-            self._default_erase_mode(region, info)
-        elif kind == LIST:
-            region.name = self.template.next_name("품번")
-            region.align = "right"
-            if not self.bulk:
-                self.add_message("품번 대조 영역을 만들었습니다. '엑셀 품번 불러오기'로 엑셀을 불러오면 대조합니다.",
-                                 WARN_COLOR)
-        else:
-            region.name = self.template.next_name("값")
-            self._default_value_style(region, info)
+        region = Region(page=self.page_no, rect=rect, kind=VALUE, sample_text=info.text)
+        amounts = [w for w in info.words if _AMOUNT.fullmatch(w.text)]
+        region.target = NUMBER if not info.words or len(amounts) * 2 >= len(info.words) else TEXT
+        region.name = self.template.next_name(self._name_prefix(region))
+        self._apply_defaults(region, info)
         self.template.regions.append(region)
         self.recompute()
         self.view.select_ids([region.id])
         self.on_view_selection([region.id])
-        if kind == LIST:
-            self._report_bulk_issues()
-        if kind == VALUE:
-            self.p_name.setFocus()
-            self.p_name.selectAll()
+
+    @staticmethod
+    def _name_prefix(region: Region) -> str:
+        if region.kind == ERASE:
+            return "삭제"
+        if region.kind == LIST:
+            return "품번"
+        return "글자" if region.target == TEXT else "값"
+
+    def _apply_defaults(self, region: Region, info) -> None:
+        """종류(지우기/바꾸기/품번 대조)에 맞는 기본 설정."""
+        if region.kind == ERASE:
+            self._default_erase_mode(region, info)
+            return
+        region.fill = ""
+        if region.kind == LIST:
+            region.align = "right"
+        elif region.target == TEXT:
+            region.align = self._guess_align(region.rect, info.bbox) if info.words else "left"
+        else:
+            self._default_value_style(region, info)
+
+    def set_region_kind(self, region: Region, kind: str, target: str | None = None) -> None:
+        """종류·수정 대상을 바꾸고 기본 설정을 맞춘다. 이름이 기본 이름이면 새 종류에 맞게 바꾼다."""
+        old_prefix = self._name_prefix(region)
+        region.kind = kind
+        if target is not None:
+            region.target = target
+        if re.fullmatch(re.escape(old_prefix) + r"\d+", region.name or ""):
+            region.name = ""
+            region.name = self.template.next_name(self._name_prefix(region))
+        res = self.results.get(region.id)
+        info = res.original if res else read_region(self.doc[region.page], region.rect, self.ocr.get(region.page))
+        self._apply_defaults(region, info)
+
+    # ── 오른쪽 클릭 메뉴 ──
+    def on_region_menu(self, region_id: str, global_pos) -> None:
+        region = self.template.region(region_id)
+        if region is None:
+            return
+        self.on_view_selection([region_id])
+        menu = QMenu(self)
+        remove = menu.addAction("영역 해제")
+        remove.setShortcut(QKeySequence(Qt.Key_Delete))
+        menu.addSeparator()
+        menu.addSection("종류")
+        choices = {}
+        for label, kind, target in [("숫자 바꾸기", VALUE, NUMBER), ("텍스트 바꾸기", VALUE, TEXT),
+                                    ("지우기", ERASE, None), ("엑셀 품번 대조", LIST, None)]:
+            a = menu.addAction(label)
+            a.setCheckable(True)
+            a.setChecked(region.kind == kind and (target is None or region.target == target))
+            choices[a] = (kind, target)
+        chosen = self._exec_menu(menu, global_pos)
+        if chosen is remove:
+            self.delete_regions({region_id})
+        elif chosen in choices:
+            kind, target = choices[chosen]
+            self.set_region_kind(region, kind, target)
+            QTimer.singleShot(0, self._after_edit)
 
     @staticmethod
     def _default_erase_mode(region: Region, info) -> None:
@@ -798,8 +850,14 @@ class MainWindow(QMainWindow):
             region.sample_text = read_region(self.doc[region.page], region.rect, self.ocr.get(region.page)).text
         self.recompute()
 
+    @staticmethod
+    def _exec_menu(menu: QMenu, global_pos):
+        return menu.exec(global_pos)
+
     def delete_selected(self) -> None:
-        ids = set(self.view.selected_ids())
+        self.delete_regions(set(self.view.selected_ids()))
+
+    def delete_regions(self, ids: set[str]) -> None:
         if not ids:
             return
         self.template.regions = [r for r in self.template.regions if r.id not in ids]
@@ -890,11 +948,15 @@ class MainWindow(QMainWindow):
                 self.p_font.setCurrentIndex(max(idx, 0))
                 self._show_style(region)
             self._set_fill_options(region.fill)
+            self.p_target.setCurrentIndex(self.p_target.findData(region.target))
+            self._show_rows(region)
             is_value = region.kind == VALUE
+            is_number = is_value and region.target != TEXT
             is_list = region.kind == LIST
             pick = region.kind == ERASE and region.erase_mode == ERASE_PICK
+            self.form.setRowVisible(self.p_target, is_value)
             for w in (self.p_number_only, self.p_formula, self.p_fmt_row_widget):
-                self.form.setRowVisible(w, is_value)
+                self.form.setRowVisible(w, is_number)
             for w in (self.p_align_row_widget, self.p_style_label, self.p_font_row_widget):
                 self.form.setRowVisible(w, is_value or is_list)
             for w in (self.p_list_unmatched, self.p_list_price):
@@ -906,8 +968,15 @@ class MainWindow(QMainWindow):
             self._fill_words(region)
         else:
             self.p_words.clear()
+            self._show_rows(None)
         self._syncing = False
         self.update_marks()
+
+    def _show_rows(self, region: Region | None) -> None:
+        """영역을 고르지 않았을 때는 안내 문구만 보여 준다."""
+        for i in range(self.form.rowCount()):
+            self.form.setRowVisible(i, region is not None)
+        self.form.setRowVisible(self.p_hint, region is None)
 
     # ── 영역 안 글자 목록 ──
     def _word_states(self, region: Region) -> list[tuple[str, str]]:
@@ -934,6 +1003,10 @@ class MainWindow(QMainWindow):
             if region.erase_mode == ERASE_PICK:
                 return [("erase", "지움") if e else ("keep", "남김") for e in res.erase_flags]
             return [("erase", "지움 (영역 전체)")] * len(words)
+        if region.target == TEXT:
+            if not res.changed:
+                return [("target", "바꿀 글자 ('새 값'에 입력)")] * len(words)
+            return [("target", f"→ '{res.new_text}'")] + [("erase", "지움")] * (len(words) - 1)
         if res.target is None:
             label = f"교체 → {res.new_text}" if res.changed else "교체 대상"
             return [("target", label)] * len(words)
@@ -998,6 +1071,9 @@ class MainWindow(QMainWindow):
                                        "같은 글자는 다른 문서에서도 같은 규칙으로 처리됩니다.")
         elif region.kind == ERASE:
             self.p_words_label.setText("영역 전체를 덮습니다. 일부만 지우려면 '글자 골라 지우기'를 선택하세요.")
+        elif region.target == TEXT:
+            self.p_words_label.setText("영역 안 글자를 모두 지우고, 영역 목록의 '새 값' 칸에 입력한 글자를 "
+                                       "같은 글꼴·크기·색으로 씁니다. 비워 두면 원본을 그대로 둡니다.")
         else:
             self.p_words_label.setText("파란색 단어가 새 값으로 바뀌고, 나머지는 그대로 남습니다.")
         self.p_words.blockSignals(True)
@@ -1071,22 +1147,19 @@ class MainWindow(QMainWindow):
         region = getattr(self, "_current", None)
         if self._syncing or region is None:
             return
-        fields_ = ("name", "kind", "formula", "prefix", "suffix", "decimals", "thousands", "align",
+        fields_ = ("name", "kind", "target", "formula", "prefix", "suffix", "decimals", "thousands", "align",
                    "font_size", "fill", "erase_mode", "unknown_action", "number_only", "font",
                    "list_unmatched", "list_price")
         before = tuple(getattr(region, f) for f in fields_)
         region.name = self.p_name.text().strip() or region.name
         new_kind = self.p_kind.currentData()
+        new_target = self.p_target.currentData()
         new_mode = self.p_erase_mode.currentData()
-        if new_kind != region.kind:
-            region.kind = new_kind
-            if new_kind == ERASE:
-                res = self.results.get(region.id)
-                info = res.original if res else read_region(self.doc[region.page], region.rect,
-                                                            self.ocr.get(region.page))
-                self._default_erase_mode(region, info)
-            else:
-                region.fill = ""
+        if new_kind != region.kind or (new_kind == VALUE and new_target != region.target):
+            self.set_region_kind(region, new_kind, new_target if new_kind == VALUE else None)
+            self.p_name.setText(region.name)
+            QTimer.singleShot(0, self._after_edit)
+            return
         elif region.kind == ERASE and new_mode != region.erase_mode:
             region.erase_mode = new_mode
             region.fill = "" if new_mode == ERASE_PICK else "#FFFFFF"

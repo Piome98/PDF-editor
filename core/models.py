@@ -9,6 +9,9 @@ ERASE = "erase"   # 영역 안의 내용을 지움
 VALUE = "value"   # 영역 안의 숫자를 새 값으로 교체
 LIST = "list"     # 엑셀 품번 목록과 대조: 엑셀에 있는 품번 줄은 남기고, 없는 품번 줄은 지움
 
+NUMBER = "number"   # 내용 바꾸기의 수정 대상: 숫자 (수식·천 단위 쉼표 등 숫자 표기 적용)
+TEXT = "text"       # 내용 바꾸기의 수정 대상: 텍스트 (입력한 글자를 그대로)
+
 ERASE_ALL = "all"     # 지우기 영역: 영역 전체를 덮음 (글자·도장 이미지 등 모두)
 ERASE_PICK = "pick"   # 지우기 영역: 영역 안의 글자 중 고른 단어만 지움
 
@@ -32,6 +35,7 @@ class Region:
     color: str = ""              # "" = 원본 색 자동 감지, 아니면 "#RRGGBB"
     fill: str = ""               # "" = 배경 유지(글자만 제거), 아니면 "#RRGGBB"로 덮음
     sample_text: str = ""        # 템플릿을 만들 때 영역 안에 있던 텍스트 (참고용)
+    target: str = NUMBER         # 내용 바꾸기 영역의 수정 대상: 숫자 | 텍스트
     # 숫자 영역: True면 숫자가 들어 있는 단어만 교체하고 라벨·단위 글자는 남긴다
     number_only: bool = True
     # 지우기 영역 (ERASE_PICK일 때): 단어 텍스트 기준 규칙이라 다른 문서에도 그대로 적용된다

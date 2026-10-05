@@ -13,9 +13,8 @@ from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem, QGraphicsRect
 
 from core.models import ERASE, Region
 
-MODE_SELECT, MODE_ERASE, MODE_VALUE, MODE_LIST = "select", "erase", "value", "list"
 COLORS = {ERASE: QColor("#E5484D"), "value": QColor("#2F6FEB"), "list": QColor("#8250DF")}
-_MODE_KIND = {MODE_ERASE: ERASE, MODE_VALUE: "value", MODE_LIST: "list"}
+DRAW_COLOR = QColor("#2F6FEB")
 HANDLE_PX = 8
 
 
@@ -161,7 +160,8 @@ class TokenItem(QGraphicsRectItem):
 
 
 class PdfView(QGraphicsView):
-    regionDrawn = Signal(str, list)          # 종류, [x0, y0, x1, y1]
+    regionDrawn = Signal(list)               # [x0, y0, x1, y1]
+    regionMenu = Signal(str, object)         # 오른쪽 클릭한 영역 id, 화면 좌표(QPoint)
     regionEdited = Signal(object)            # Region
     selectionIds = Signal(list)              # 선택된 영역 id 목록
     deleteRequested = Signal()
@@ -176,7 +176,7 @@ class PdfView(QGraphicsView):
         self.setBackgroundBrush(QColor("#E9EBEF"))
         self.setDragMode(QGraphicsView.NoDrag)
         self.setAcceptDrops(True)
-        self.mode = MODE_SELECT
+        self.draw_enabled = True             # 빈 곳을 드래그하면 새 영역
         self.zoom = 1.0
         self.page_rect = QRectF()
         self._page_item: QGraphicsPixmapItem | None = None
@@ -261,23 +261,42 @@ class PdfView(QGraphicsView):
             return
         super().wheelEvent(event)
 
-    # ── 마우스로 영역 그리기 ──
-    def set_mode(self, mode: str) -> None:
-        self.mode = mode
-        self.viewport().setCursor(Qt.ArrowCursor if mode == MODE_SELECT else Qt.CrossCursor)
-        for item in self._items.values():
-            item.setFlag(QGraphicsItem.ItemIsMovable, mode == MODE_SELECT)
+    # ── 마우스: 빈 곳 드래그 = 새 영역, 영역 클릭/드래그 = 선택/이동, 오른쪽 클릭 = 메뉴 ──
+    def set_draw_enabled(self, on: bool) -> None:
+        self.draw_enabled = on
+        self.viewport().setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+
+    def _region_at(self, view_pos) -> RegionItem | None:
+        """화면 위치에 있는 영역 (겹치면 가장 작은 것). 이름표·단어 표시 위를 눌러도 그 영역으로 본다."""
+        scene_pos = self.mapToScene(view_pos)
+        hits = [item for item in self._items.values()
+                if item.isVisible() and item.sceneBoundingRect().contains(scene_pos)]
+        return min(hits, key=lambda it: it.rect().width() * it.rect().height()) if hits else None
 
     def mousePressEvent(self, event):
-        if self.mode != MODE_SELECT and event.button() == Qt.LeftButton and not self.page_rect.isEmpty():
-            self._draw_start = self.mapToScene(event.position().toPoint())
-            self._rubber = QGraphicsRectItem()
-            pen = QPen(COLORS[_MODE_KIND[self.mode]], 1.5, Qt.DashLine)
-            pen.setCosmetic(True)
-            self._rubber.setPen(pen)
-            self.scene().addItem(self._rubber)
-            return
+        pos = event.position().toPoint()
+        if event.button() == Qt.LeftButton:
+            item = self.itemAt(pos)
+            empty = item is None or item is self._page_item
+            if empty and self.draw_enabled and not self.page_rect.isEmpty():
+                self.scene().clearSelection()
+                self._draw_start = self.mapToScene(pos)
+                self._rubber = QGraphicsRectItem()
+                pen = QPen(DRAW_COLOR, 1.5, Qt.DashLine)
+                pen.setCosmetic(True)
+                self._rubber.setPen(pen)
+                self.scene().addItem(self._rubber)
+                return
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        item = self._region_at(event.pos())
+        if item is None:
+            super().contextMenuEvent(event)
+            return
+        self.scene().clearSelection()
+        item.setSelected(True)
+        self.regionMenu.emit(item.region.id, event.globalPos())
 
     def mouseMoveEvent(self, event):
         if self._draw_start is not None and self._rubber is not None:
@@ -292,9 +311,8 @@ class PdfView(QGraphicsView):
             self.scene().removeItem(self._rubber)
             self._rubber, self._draw_start = None, None
             if r.width() >= 4 and r.height() >= 4:
-                kind = _MODE_KIND[self.mode]
-                self.regionDrawn.emit(kind, [round(r.left(), 2), round(r.top(), 2),
-                                             round(r.right(), 2), round(r.bottom(), 2)])
+                self.regionDrawn.emit([round(r.left(), 2), round(r.top(), 2),
+                                       round(r.right(), 2), round(r.bottom(), 2)])
             return
         super().mouseReleaseEvent(event)
 

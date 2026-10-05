@@ -14,7 +14,7 @@ from . import fonts
 from .bulk import BulkItem, BulkList, norm_key
 from .fonts import TextStyle
 from .formula import FormulaError, evaluate, expand_wildcards, is_valid_name
-from .models import ERASE, ERASE_PICK, LIST, VALUE, Region, Template
+from .models import ERASE, ERASE_PICK, LIST, TEXT, VALUE, Region, Template
 from .numbers import detect_style, format_number, parse_number
 from .words import Word, order_words, words_in_rect
 
@@ -104,7 +104,7 @@ def page_sizes(doc: pymupdf.Document) -> list[list[float]]:
 
 def number_target(region: Region, words: list[Word]) -> int | None:
     """숫자 영역에서 교체할 단어(숫자가 들어 있는 첫 단어)의 위치."""
-    if region.kind != VALUE or not region.number_only:
+    if region.kind != VALUE or region.target == TEXT or not region.number_only:
         return None
     return next((i for i, w in enumerate(words) if parse_number(w.text) is not None), None)
 
@@ -202,7 +202,7 @@ def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str],
             res.error = "PDF에 해당 페이지가 없습니다"
         results[r.id] = res
 
-    value_regions = [r for r in tpl.regions if r.kind == VALUE]
+    value_regions = [r for r in tpl.regions if r.kind == VALUE and r.target != TEXT]
     by_name: dict[str, Region] = {}
     for r in value_regions:
         by_name.setdefault(r.name, r)
@@ -244,6 +244,9 @@ def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str],
         if r.kind == ERASE:
             res.changed = any(res.erase_flags) if r.erase_mode == ERASE_PICK else True
             continue
+        if r.kind == VALUE and r.target == TEXT:
+            _compute_text(doc, r, res, inputs.get(r.id, ""), ocr)
+            continue
         if r.kind == LIST:
             if bulk is None or not bulk.items:
                 res.error = "엑셀 품번 목록을 먼저 불러오세요"
@@ -284,6 +287,19 @@ def _is_amount(text: str) -> bool:
 
 def _cx(w: Word) -> float:
     return (w.bbox[0] + w.bbox[2]) / 2
+
+
+def _compute_text(doc: pymupdf.Document, r: Region, res: RegionResult, new: str, ocr: OcrMap | None) -> None:
+    """텍스트 바꾸기: 영역 안 글자를 모두 지우고, 첫 단어 자리에 같은 서식으로 새 글자를 쓴다."""
+    new = new.strip()
+    if not new or _norm(new) == _norm(res.original.text):
+        return                                   # 입력이 없으면 원본 그대로
+    words = res.original.words
+    res.new_text = new
+    res.target = 0 if words else None
+    res.erase_flags = [True] * len(words)
+    res.changed = True
+    res.style = region_style(doc, r, res, ocr)
 
 
 def _compute_list(doc: pymupdf.Document, r: Region, res: RegionResult, bulk: BulkList,
@@ -412,7 +428,8 @@ def expected_text(r: Region, res: RegionResult) -> str:
         return res.new_text
     new = {e.word: e.text for e in edits_of(r, res)}
     erase = res.erase_flags or [False] * len(res.original.words)
-    return " ".join(new.get(i, w.text) for i, w in enumerate(res.original.words) if not erase[i])
+    return " ".join(new[i] if i in new else w.text for i, w in enumerate(res.original.words)
+                    if i in new or not erase[i])
 
 
 # ───────────────────────── 쓰기 ─────────────────────────
@@ -466,6 +483,8 @@ def redact_rects(r: Region, res: RegionResult, image_page: bool = False
         if r.erase_mode == ERASE_PICK:
             return [word_item(w) for w, e in zip(res.original.words, res.erase_flags) if e]
         return [whole]
+    if r.kind == VALUE and r.target == TEXT and res.original.words:
+        return [word_item(w) for w in res.original.words]
     if res.target is not None:
         return [word_item(res.original.words[res.target])]
     return [whole]
@@ -495,7 +514,7 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
             res = results[r.id]
             for e in edits_of(r, res):
                 style = e.style or word_style(doc, r, res.original.words, e.word, e.text, ocr)
-                _draw_replacement(page, r, res.original, e.word, e.text, style)
+                _draw_replacement(page, r, res.original, e.word, e.text, style, res.erase_flags)
     try:
         out.subset_fonts()       # 넣은 글꼴에서 실제 쓴 글자만 남겨 파일 크기를 줄인다
     except Exception:  # noqa: BLE001
@@ -503,14 +522,15 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
     return out
 
 
-def _bounds(rect: pymupdf.Rect, words: list[Word], idx: int | None, size: float) -> tuple[float, float]:
+def _bounds(rect: pymupdf.Rect, words: list[Word], idx: int | None, size: float,
+            erased: list[bool] | None = None) -> tuple[float, float]:
     """새 글자를 쓸 수 있는 가로 범위: 영역 안이면서, 같은 줄에 남겨 둔 글자(라벨·단위)와 겹치지 않는 곳."""
     left, right = rect.x0 + 1, rect.x1 - 1
     if idx is not None:
         target = words[idx]
         gap = size * 0.25
-        for w in words:
-            if w is target or w.line != target.line:
+        for i, w in enumerate(words):
+            if w is target or w.line != target.line or (erased and erased[i]):
                 continue
             if w.bbox[2] <= target.bbox[0]:
                 left = max(left, w.bbox[2] + gap)
@@ -539,12 +559,18 @@ def _place(align: str, anchor: pymupdf.Rect, x0: float, x1: float, left: float, 
 
 
 def _draw_replacement(page: pymupdf.Page, r: Region, info: TextInfo, idx: int | None, text: str,
-                      style: TextStyle) -> None:
+                      style: TextStyle, erased: list[bool] | None = None) -> None:
     rect = pymupdf.Rect(r.rect)
     target = info.words[idx] if idx is not None else None
     size = style.size or rect.height * 0.7
-    left, right = _bounds(rect, info.words, idx, size)
+    left, right = _bounds(rect, info.words, idx, size, erased)
     anchor = _anchor(rect, info, idx, left, right)
+    # 텍스트 바꾸기(줄의 글자를 모두 지우고 새로 씀): 지운 글자들 전체 자리를 기준으로 정렬
+    whole_line = bool(target is not None and erased and erased[idx])
+    if whole_line:
+        for i, w in enumerate(info.words):
+            if erased[i] and w.line == target.line:
+                anchor |= pymupdf.Rect(w.bbox)
     baseline = target.baseline if target else info.baseline
 
     if style.raster_dpi and style.face is not None:
@@ -554,7 +580,7 @@ def _draw_replacement(page: pymupdf.Page, r: Region, info: TextInfo, idx: int | 
             size *= (right - left) / max(ink1 - ink0, 0.01)
             png, (w, h), (ox, oy), (ink0, ink1) = fonts.text_png(text, style.face, size, style.color,
                                                                  style.raster_dpi)
-        if style.origin is not None and style.old_advance:
+        if style.origin is not None and style.old_advance and not whole_line:
             # 원래 글자의 시작점·글자 폭을 기준으로 정렬 (표 칸 정렬 방식과 같음)
             new_adv = fonts.advance(style.face, size, text)
             ox0, y = style.origin
@@ -567,7 +593,10 @@ def _draw_replacement(page: pymupdf.Page, r: Region, info: TextInfo, idx: int | 
             x = min(max(x, left - ink0), right - ink1)
         else:
             x = _place(r.align, anchor, ink0, ink1, left, right)
-            y = baseline if baseline is not None else rect.y0 + (rect.height + size * 0.7) / 2
+            if style.origin is not None:
+                y = style.origin[1]
+            else:
+                y = baseline if baseline is not None else rect.y0 + (rect.height + size * 0.7) / 2
         x0, y0 = x - ox, y - oy
         if style.raster_grid is not None:
             # 넣는 그림의 픽셀을 원본 이미지의 픽셀 격자에 맞추고, 남는 소수점은 그림 안에서 글자를 밀어 보정
@@ -659,7 +688,8 @@ def write_log(path: str, tpl: Template, results: dict[str, RegionResult], checks
             elif res and r.kind == ERASE:
                 erased = "(영역 전체)"
             w.writerow([
-                r.page + 1, r.name, {ERASE: "삭제", LIST: "품번대조"}.get(r.kind, "값"),
+                r.page + 1, r.name,
+                {ERASE: "삭제", LIST: "품번대조"}.get(r.kind, "텍스트" if r.target == TEXT else "숫자"),
                 res.original.text if res else "",
                 expected_text(r, res) if res and not res.error else "",
                 erased,

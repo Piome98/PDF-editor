@@ -177,3 +177,31 @@ def test_value_region_replaces_only_number(sample):
     out = apply(sample, tpl, results)
     assert all(c.ok for c in verify(out, tpl, results))
     assert read_region(out[0], row).text == "합계 ₩3,000,000"
+
+
+# ── 텍스트 바꾸기 ──
+from core.models import TEXT  # noqa: E402
+
+
+def test_text_target_replaces_whole_region(sample):
+    r = Region(0, CONTACT_RECT, VALUE, "담당자", target=TEXT, align="left")
+    tpl = Template(regions=[r])
+    assert not compute(sample, tpl, {})[r.id].changed          # 입력이 없으면 그대로
+    results = compute(sample, tpl, {r.id: "담당자: 김철수  02-555-0000"})
+    res = results[r.id]
+    assert res.changed and not res.error and res.style.source == "pdf"
+    out = apply(sample, tpl, results)
+    assert all(c.ok for c in verify(out, tpl, results))
+    assert read_region(out[0], CONTACT_RECT).text == "담당자: 김철수 02-555-0000"
+    assert "부가세 포함 금액입니다" in out[0].get_text()
+    first_old = read_words(sample[0], CONTACT_RECT)[0]
+    first_new = read_words(out[0], CONTACT_RECT)[0]
+    assert first_new.bbox[0] == pytest.approx(first_old.bbox[0], abs=0.3)   # 같은 자리에서 시작
+    assert first_new.size == pytest.approx(first_old.size) and first_new.baseline == pytest.approx(first_old.baseline)
+
+
+def test_text_regions_are_not_formula_names(sample):
+    tpl = Template(regions=[Region(0, CONTACT_RECT, VALUE, "메모", target=TEXT),
+                            Region(0, cell(1, 1), VALUE, "단가1", formula="메모*2")])
+    res = compute(sample, tpl, {})
+    assert "메모" in res[tpl.regions[1].id].error

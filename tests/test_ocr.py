@@ -95,3 +95,14 @@ def test_value_replace_on_image_pdf(image_pdf, ocr):
     out = apply(image_pdf, tpl, results, ocr)
     checks = verify(out, tpl, results, reocr(out, ocr))
     assert all(c.ok for c in checks), [c.message for c in checks if not c.ok]
+
+
+def test_text_target_on_image_pdf(image_pdf, ocr):
+    from core.models import TEXT
+    r = Region(0, CONTACT_RECT, VALUE, "담당자", target=TEXT, align="left")
+    tpl = Template(regions=[r])
+    results = compute(image_pdf, tpl, {r.id: "담당자: 김철수 02-555-0000"}, ocr)
+    assert results[r.id].changed and results[r.id].style.source == "matched"
+    out = apply(image_pdf, tpl, results, ocr)
+    checks = verify(out, tpl, results, reocr(out, ocr))
+    assert all(c.ok for c in checks), [c.message for c in checks]
