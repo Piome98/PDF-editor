@@ -49,7 +49,7 @@ class BatchFile:
         return total
 
 
-def open_file(bf: BatchFile) -> None:
+def open_file(bf: BatchFile, ocr_all_pages: bool = False) -> None:
     try:
         doc = pymupdf.open(bf.path)
         if not doc.is_pdf:
@@ -60,7 +60,8 @@ def open_file(bf: BatchFile) -> None:
         bf.error = f"열 수 없음: {e}"
         return
     bf.doc = doc
-    bf.ocr_pages = [i for i in range(len(doc)) if needs_ocr(doc[i])]
+    # ocr_all_pages: 모든 쪽을 OCR (텍스트로 된 글자는 PDF 글자를 그대로 쓰고, 그림 속 글자만 OCR 결과를 씀)
+    bf.ocr_pages = [i for i in range(len(doc)) if ocr_all_pages or needs_ocr(doc[i])]
 
 
 def process(bf: BatchFile, tpl: Template, bulk: BulkList | None, inputs: dict[str, str] | None = None,

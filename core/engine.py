@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import difflib
 import math
 import re
 import statistics
@@ -47,6 +48,7 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
     r = pymupdf.Rect(rect)
     raw = page.get_text("rawdict", clip=r + (-2, -2, 2, 2))
     words: list[Word] = []
+    hidden = _invisible_origins(page)
 
     for block in raw.get("blocks", []):
         for line in block.get("lines", []):
@@ -57,7 +59,8 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
                 if cur and cur["chars"]:
                     words.append(Word("".join(cur["chars"]), tuple(cur["bbox"]), cur["size"],
                                       cur["color"], cur["baseline"], font=cur["font"],
-                                      bold=bool(cur["flags"] & 16), italic=bool(cur["flags"] & 2)))
+                                      bold=bool(cur["flags"] & 16), italic=bool(cur["flags"] & 2),
+                                      invisible=cur["hidden"] * 2 > len(cur["chars"])))
                 cur = None
 
             for span in line.get("spans", []):
@@ -73,8 +76,10 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
                     if cur is None:
                         cur = {"chars": [], "bbox": pymupdf.Rect(bb), "size": span["size"],
                                "color": _rgb(span["color"]), "baseline": ch["origin"][1],
-                               "font": span["font"], "flags": span["flags"]}
+                               "font": span["font"], "flags": span["flags"], "hidden": 0}
                     cur["chars"].append(ch["c"])
+                    if (round(ch["origin"][0], 1), round(ch["origin"][1], 1)) in hidden:
+                        cur["hidden"] += 1
                     cur["bbox"] |= bb
             flush()
 
@@ -82,9 +87,57 @@ def read_words(page: pymupdf.Page, rect) -> list[Word]:
     return order_words(words)
 
 
+def _invisible_origins(page: pymupdf.Page) -> set[tuple[float, float]]:
+    """화면에 그려지지 않는 글자(렌더 모드 3, 투명)의 위치."""
+    out = set()
+    try:
+        for span in page.get_texttrace():
+            if span.get("type") == 3 or span.get("opacity", 1) == 0:
+                for ch in span["chars"]:
+                    out.add((round(ch[2][0], 1), round(ch[2][1], 1)))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+_BAD_CHAR = re.compile(r"[\ufffd\ue000-\uf8ff\x00-\x08\x0b-\x1f]")
+
+
+def _overlap(a: Word, b: Word) -> float:
+    """두 단어가 겹친 면적 ÷ 작은 쪽 면적."""
+    ra, rb = pymupdf.Rect(a.bbox), pymupdf.Rect(b.bbox)
+    inter = ra & rb
+    small = min(abs(ra), abs(rb))
+    return abs(inter) / small if small > 0 and not inter.is_empty else 0.0
+
+
+def merge_words(text_words: list[Word], ocr_words: list[Word]) -> list[Word]:
+    """텍스트 레이어와 OCR을 합친다.
+
+    - 제대로 읽히는 텍스트 레이어 단어는 그대로 쓴다 (원본 글꼴·정확한 위치·진짜 글자 삭제).
+    - 보이지 않는 글자, 깨진 글자, OCR이 확실히 다르게 읽은 글자는 버리고 그 자리는 OCR 단어를 쓴다.
+    - 텍스트 레이어가 없는 곳(이미지)은 OCR 단어를 쓴다.
+    """
+    kept = []
+    for t in text_words:
+        if t.invisible or _BAD_CHAR.search(t.text):
+            continue
+        over = [o for o in ocr_words if _overlap(t, o) > 0.5]
+        if over:
+            o = max(over, key=lambda o: _overlap(t, o))
+            similar = difflib.SequenceMatcher(None, _norm(t.text), _norm(o.text)).ratio()
+            if o.score >= 0.9 and similar < 0.5 and len(_norm(o.text)) >= 2:
+                continue       # 글자 대응표가 잘못된 PDF: 보이는 모양(OCR)을 믿는다
+        kept.append(t)
+    extra = [o for o in ocr_words if not any(_overlap(o, t) > 0.3 for t in kept)]
+    return order_words(kept + extra)
+
+
 def read_region(page: pymupdf.Page, rect, ocr_words: list[Word] | None = None) -> TextInfo:
-    """영역 안의 글자를 읽는다. ocr_words가 있으면(이미지 PDF) 텍스트 레이어 대신 OCR 결과를 쓴다."""
-    words = words_in_rect(ocr_words, rect) if ocr_words is not None else read_words(page, rect)
+    """영역 안의 글자를 읽는다. 그 쪽을 OCR했으면(ocr_words) 텍스트 레이어와 OCR을 합쳐 쓴다."""
+    words = read_words(page, rect)
+    if ocr_words is not None:
+        words = merge_words(words, words_in_rect(ocr_words, rect))
     if not words:
         return TextInfo()
     box = pymupdf.Rect(words[0].bbox)
@@ -501,7 +554,7 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
         if not regions:
             continue
         page = out[page_no]
-        image_page = page_no in (ocr or {})
+        image_page = any(_uses_image(r, results[r.id], doc[page_no]) for r in regions)
         for r in regions:
             for rect, fill in redact_rects(r, results[r.id], image_page):
                 page.add_redact_annot(rect, fill=fill, cross_out=False)
@@ -520,6 +573,18 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def _uses_image(r: Region, res: RegionResult, page: pymupdf.Page) -> bool:
+    """이 영역을 고치려면 이미지 픽셀을 지워야 하는지 (지우거나 바꾸는 단어가 OCR로 읽은 그림 글자인지)."""
+    words = res.original.words
+    touched = {e.word for e in edits_of(r, res) if e.word is not None}
+    touched |= {i for i, e in enumerate(res.erase_flags) if e}
+    if touched:
+        return any(words[i].ocr for i in touched if i < len(words))
+    # 영역 전체를 덮는 경우: 그 자리에 이미지가 있으면
+    rect = pymupdf.Rect(r.rect)
+    return any(pymupdf.Rect(i["bbox"]).intersects(rect) for i in page.get_image_info())
 
 
 def _bounds(rect: pymupdf.Rect, words: list[Word], idx: int | None, size: float,

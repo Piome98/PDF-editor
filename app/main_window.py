@@ -5,7 +5,7 @@ import os
 import re
 
 import pymupdf
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QGuiApplication, QImage, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QProgressDialog,
                                QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComb
                                QToolBar, QVBoxLayout, QWidget)
 
 from core.bulk import BulkList, read_table
-from core.engine import (RegionResult, apply, bulk_report, check_template, compute, list_summary, number_target,
+from core.engine import (RegionResult, apply, bulk_report, check_template, compute, list_summary, merge_words,
+                         number_target, read_words,
                          page_sizes, read_region, region_style, word_style, write_bulk_report,
                          verify, write_log)
 from core.fonts import font_choices
@@ -48,6 +49,8 @@ class MainWindow(QMainWindow):
         self.ocr: dict[int, list] = {}               # 쪽 번호 → OCR로 읽은 단어 (이미지 PDF)
         self._ocr_job: OcrJob | None = None
         self._batch: BatchDialog | None = None
+        self.settings = QSettings("PdfPriceEditor", "PdfPriceEditor")
+        self.ocr_on_open = self.settings.value("ocr_on_open", True, type=bool)
         self.bulk: BulkList | None = None              # 엑셀 품번 목록 (작업마다 다름, 템플릿에는 저장 안 함)
         self.page_no = 0
         self.last_dir = os.path.expanduser("~")
@@ -127,6 +130,12 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         act("글자 인식(OCR)", self.run_ocr_all, tip="모든 쪽을 OCR로 다시 읽기 "
             "(글자가 깨져 읽히거나, 일부만 이미지인 PDF에 사용)")
+        self.ocr_open_action = act("열 때 OCR", self.toggle_ocr_on_open,
+                                   tip="켜 두면 PDF를 열 때마다 모든 쪽을 OCR합니다 (한 쪽에 10초 정도).\n"
+                                   "텍스트로 된 글자는 PDF 글자를 그대로 쓰고, 그림 속 글자·안 보이는 글자·"
+                                   "깨진 글자만 OCR 결과로 대신합니다.\n끄면 그림으로 된 쪽만 OCR합니다.",
+                                   checkable=True)
+        self.ocr_open_action.setChecked(self.ocr_on_open)
 
     def _build_side_panel(self) -> None:
         self.side = QWidget()
@@ -386,7 +395,8 @@ class MainWindow(QMainWindow):
         self.recompute()
         self.update_title()
         QTimer.singleShot(0, self.view.fit_width)
-        image_pages = [i for i in range(len(doc)) if needs_ocr(doc[i]) and i not in self.ocr]
+        image_pages = [i for i in range(len(doc))
+                       if i not in self.ocr and (self.ocr_on_open or needs_ocr(doc[i]))]
         if image_pages:
             QTimer.singleShot(50, lambda: self.start_ocr(image_pages, auto=True))
 
@@ -400,8 +410,11 @@ class MainWindow(QMainWindow):
             return
         self._cancel_ocr()
         if auto:
-            self.add_message(f"이미지로 된 PDF입니다({len(pages)}쪽). OCR로 글자를 읽습니다. "
-                             "인식이 불확실한 글자는 '영역 안 글자' 목록에 ⚠로 표시됩니다.", WARN_COLOR)
+            images = sum(1 for p in pages if needs_ocr(self.doc[p]))
+            kind = f"그림으로 된 쪽 {images}개 포함, " if images else ""
+            self.add_message(f"글자 인식(OCR)을 실행합니다 ({kind}{len(pages)}쪽). 텍스트로 된 글자는 PDF 글자를 "
+                             "그대로 쓰고, 그림 속 글자만 OCR 결과를 씁니다. 인식이 불확실한 글자는 "
+                             "'영역 안 글자' 목록에 ⚠로 표시됩니다.", WARN_COLOR)
         job = OcrJob(self.doc, pages, self)
         dlg = QProgressDialog("글자를 인식하는 중입니다 (한 쪽에 10초 정도)...", "취소", 0, len(pages), self)
         dlg.setWindowTitle(APP_TITLE)
@@ -424,10 +437,16 @@ class MainWindow(QMainWindow):
             self._ocr_job = None
             done = len(job.results)
             if completed:
-                low = sum(1 for ws in job.results.values() for w in ws if w.score < 0.8)
-                msg = f"OCR 완료: {done}쪽에서 단어 {sum(len(ws) for ws in job.results.values())}개를 읽었습니다."
-                if low:
-                    msg += f" 그중 {low}개는 인식이 불확실합니다."
+                # 텍스트로 된 글자는 PDF 글자를 쓰므로, 실제로 OCR 결과를 쓰는 단어만 센다
+                used = [x for p, ws in job.results.items()
+                        for x in merge_words(read_words(self.doc[p], self.doc[p].rect), ws) if x.ocr]
+                low = sum(1 for x in used if x.score < 0.8)
+                if used:
+                    msg = f"OCR 완료 ({done}쪽): 그림 속 글자 {len(used)}개를 OCR로 읽었습니다."
+                    if low:
+                        msg += f" 그중 {low}개는 인식이 불확실합니다."
+                else:
+                    msg = f"OCR 완료 ({done}쪽): 모든 글자를 PDF의 텍스트로 읽을 수 있어 PDF 글자를 그대로 씁니다."
                 self.add_message(msg, OK_COLOR)
             else:
                 self.add_message(f"OCR이 중단되었습니다 ({done}/{len(pages)}쪽만 읽음).", WARN_COLOR)
@@ -506,6 +525,12 @@ class MainWindow(QMainWindow):
             return
         base = os.path.splitext(self.doc_path)[0] if self.doc_path else os.path.join(self.last_dir, "대조결과")
         BulkReportDialog(bulk_report(self.template, self.results, self.bulk), base + "_엑셀대조.csv", self).exec()
+
+    def toggle_ocr_on_open(self) -> None:
+        self.ocr_on_open = self.ocr_open_action.isChecked()
+        self.settings.setValue("ocr_on_open", self.ocr_on_open)
+        self.statusBar().showMessage("PDF를 열 때 모든 쪽을 OCR합니다." if self.ocr_on_open
+                                     else "PDF를 열 때 그림으로 된 쪽만 OCR합니다.", 4000)
 
     def run_ocr_all(self) -> None:
         if self.doc:

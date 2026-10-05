@@ -23,6 +23,7 @@ class Word:
     font: str = ""
     bold: bool = False
     italic: bool = False
+    invisible: bool = False                          # 화면에 안 보이는 글자 (스캐너 OCR이 이미지 위에 깔아 둔 글자 등)
     # OCR 단어: 글꼴·색 추정용 원본 글자 그림 (잉크 마스크, 컬러 픽셀)과 해상도
     patch: np.ndarray | None = field(default=None, repr=False, compare=False)
     patch_rgb: np.ndarray | None = field(default=None, repr=False, compare=False)

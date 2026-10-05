@@ -231,12 +231,12 @@ class BatchDialog(QDialog):
             return
         bf = self.files[self._index]
         self.summary.setText(f"{bf.number}/{len(self.files)} {bf.name} 처리 중...")
-        open_file(bf)
+        open_file(bf, self.main.ocr_on_open)
         if bf.error or not bf.ocr_pages:
             self._after_ocr(bf)
             return
-        self.summary.setText(f"{bf.number}/{len(self.files)} {bf.name} — 이미지 PDF라 글자 인식 중 "
-                             f"({len(bf.ocr_pages)}쪽)...")
+        self.summary.setText(f"{bf.number}/{len(self.files)} {bf.name} — 글자 인식(OCR) 중 "
+                             f"({len(bf.ocr_pages)}쪽, 한 쪽에 10초 정도)...")
         job = OcrJob(bf.doc, bf.ocr_pages, self)
         job.pageDone.connect(lambda p, words, bf=bf: bf.ocr.__setitem__(p, words))
         job.failed.connect(lambda msg, bf=bf: setattr(bf, "error", msg))
