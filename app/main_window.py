@@ -22,6 +22,7 @@ from core.models import ERASE, ERASE_ALL, ERASE_PICK, LIST, NUMBER, TEXT, VALUE,
 from core.numbers import detect_style
 from core.ocr import models_available, needs_ocr
 
+from .batch_dialog import BatchDialog
 from .bulk_dialogs import BulkReportDialog, ExcelImportDialog
 from .ocr_job import OcrJob
 from .pdf_view import PdfView
@@ -46,6 +47,7 @@ class MainWindow(QMainWindow):
         self.preview_doc: pymupdf.Document | None = None
         self.ocr: dict[int, list] = {}               # 쪽 번호 → OCR로 읽은 단어 (이미지 PDF)
         self._ocr_job: OcrJob | None = None
+        self._batch: BatchDialog | None = None
         self.bulk: BulkList | None = None              # 엑셀 품번 목록 (작업마다 다름, 템플릿에는 저장 안 함)
         self.page_no = 0
         self.last_dir = os.path.expanduser("~")
@@ -120,6 +122,8 @@ class MainWindow(QMainWindow):
         act("엑셀 품번 불러오기", self.open_excel_dialog, "Ctrl+E",
             "품번·가격이 적힌 엑셀(.xlsx/.csv)을 불러와 '품번 대조 영역'과 비교")
         act("대조 결과", self.show_bulk_report, "Ctrl+R", "엑셀 품번 하나하나가 PDF에 있는지, 가격이 맞는지")
+        act("여러 파일 일괄 처리", lambda: self.open_batch([]), "Ctrl+B",
+            "같은 양식의 PDF 여러 개에 지금 영역(템플릿)·엑셀 대조를 한꺼번에 적용하고 '번호. 품번….pdf'로 저장")
         tb.addSeparator()
         act("글자 인식(OCR)", self.run_ocr_all, tip="모든 쪽을 OCR로 다시 읽기 "
             "(글자가 깨져 읽히거나, 일부만 이미지인 PDF에 사용)")
@@ -313,21 +317,49 @@ class MainWindow(QMainWindow):
 
     # ───────────────────────── 파일 ─────────────────────────
     def on_files_dropped(self, paths: list[str]) -> None:
-        for p in paths:
+        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+        for p in paths:                       # 템플릿·엑셀을 먼저 불러온 뒤 PDF를 연다
             ext = os.path.splitext(p)[1].lower()
-            if ext == ".pdf":
-                self.open_pdf(p)
-            elif ext == ".json":
+            if ext == ".json":
                 self.open_template(p)
             elif ext in (".xlsx", ".xlsm", ".csv", ".xls"):
                 self.load_excel(p)
+        if len(pdfs) > 1:
+            self.open_batch(pdfs)
+        elif pdfs:
+            self.open_pdf(pdfs[0])
 
     def open_pdf_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "PDF 열기", self.last_dir, "PDF (*.pdf)")
-        if path:
-            self.open_pdf(path)
+        paths, _ = QFileDialog.getOpenFileNames(self, "PDF 열기 (여러 개를 고르면 일괄 처리)", self.last_dir,
+                                                "PDF (*.pdf)")
+        if len(paths) > 1:
+            self.open_batch(paths)
+        elif paths:
+            self.open_pdf(paths[0])
 
-    def open_pdf(self, path: str) -> None:
+    def open_batch(self, paths: list[str]) -> None:
+        """여러 파일 일괄 처리 창. 영역이 아직 없으면 첫 파일을 열어 영역부터 만들게 한다."""
+        if not self.template.regions:
+            opened = False
+            if paths and not self.doc:
+                self.open_pdf(paths[0])
+                opened = True
+            QMessageBox.information(
+                self, APP_TITLE,
+                "여러 파일에 적용할 영역(템플릿)이 아직 없습니다.\n"
+                "PDF 하나에서 영역을 만들거나 템플릿을 불러온 뒤, 다시 '여러 파일 일괄 처리'(Ctrl+B)를 누르세요."
+                + ("\n\n첫 번째 파일을 열어 두었습니다." if opened else ""))
+            return
+        if paths:
+            self.last_dir = os.path.dirname(paths[0])
+        if self._batch is None or not self._batch.isVisible():
+            self._batch = BatchDialog(self, paths)
+            self._batch.show()
+        else:
+            self._batch.add_files(paths)
+            self._batch.raise_()
+
+    def open_pdf(self, path: str, ocr: dict | None = None) -> None:
         try:
             doc = pymupdf.open(path)
             if not doc.is_pdf:
@@ -339,7 +371,7 @@ class MainWindow(QMainWindow):
             return
         self._cancel_ocr()
         self.doc, self.doc_path = doc, path
-        self.ocr = {}
+        self.ocr = dict(ocr) if ocr else {}      # 일괄 처리에서 이미 읽은 OCR 결과가 있으면 다시 읽지 않음
         self.last_dir = os.path.dirname(path)
         self.inputs = {}
         self.page_no = 0
@@ -354,7 +386,7 @@ class MainWindow(QMainWindow):
         self.recompute()
         self.update_title()
         QTimer.singleShot(0, self.view.fit_width)
-        image_pages = [i for i in range(len(doc)) if needs_ocr(doc[i])]
+        image_pages = [i for i in range(len(doc)) if needs_ocr(doc[i]) and i not in self.ocr]
         if image_pages:
             QTimer.singleShot(50, lambda: self.start_ocr(image_pages, auto=True))
 
