@@ -12,16 +12,18 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QColorDialog, QComb
                                QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
                                QToolBar, QVBoxLayout, QWidget)
 
-from core.engine import (RegionResult, apply, check_template, compute, number_target, page_sizes, read_region,
-                         region_style,
+from core.bulk import BulkList, read_table
+from core.engine import (RegionResult, apply, bulk_report, check_template, compute, list_summary, number_target,
+                         page_sizes, read_region, region_style, word_style, write_bulk_report,
                          verify, write_log)
 from core.fonts import font_choices
-from core.models import ERASE, ERASE_ALL, ERASE_PICK, VALUE, Region, Template
+from core.models import ERASE, ERASE_ALL, ERASE_PICK, LIST, VALUE, Region, Template
 from core.numbers import detect_style
 from core.ocr import models_available, needs_ocr
 
+from .bulk_dialogs import BulkReportDialog, ExcelImportDialog
 from .ocr_job import OcrJob
-from .pdf_view import MODE_ERASE, MODE_SELECT, MODE_VALUE, PdfView
+from .pdf_view import MODE_ERASE, MODE_LIST, MODE_SELECT, MODE_VALUE, PdfView
 
 APP_TITLE = "PDF 가격 수정기"
 COL_PAGE, COL_KIND, COL_NAME, COL_ORIG, COL_INPUT, COL_RESULT, COL_STATUS = range(7)
@@ -41,6 +43,7 @@ class MainWindow(QMainWindow):
         self.preview_doc: pymupdf.Document | None = None
         self.ocr: dict[int, list] = {}               # 쪽 번호 → OCR로 읽은 단어 (이미지 PDF)
         self._ocr_job: OcrJob | None = None
+        self.bulk: BulkList | None = None              # 엑셀 품번 목록 (작업마다 다름, 템플릿에는 저장 안 함)
         self.page_no = 0
         self.last_dir = os.path.expanduser("~")
         self._syncing = False
@@ -97,6 +100,7 @@ class MainWindow(QMainWindow):
             (MODE_SELECT, "선택/이동", "V", "영역을 선택하고 옮기거나, 오른쪽 아래 모서리를 끌어 크기 조절"),
             (MODE_VALUE, "＋ 숫자 영역", "N", "드래그해서 새 숫자로 바꿀 영역 지정"),
             (MODE_ERASE, "＋ 지울 영역", "E", "드래그해서 지울 영역 지정"),
+            (MODE_LIST, "＋ 품번 대조 영역", "L", "드래그해서 엑셀 품번과 대조할 표(목록) 영역 지정"),
         ]:
             a = act(text, lambda _=False, m=mode: self.set_mode(m), key, tip, checkable=True)
             self.mode_group.addAction(a)
@@ -115,6 +119,10 @@ class MainWindow(QMainWindow):
         self.preview_action = act("결과 미리보기", self.toggle_preview, "F5",
                                   "수정 결과를 미리 보기 (다시 누르면 원본)", checkable=True)
         act("결과 PDF 저장", self.export_pdf, "Ctrl+S")
+        tb.addSeparator()
+        act("엑셀 품번 불러오기", self.open_excel_dialog, "Ctrl+E",
+            "품번·가격이 적힌 엑셀(.xlsx/.csv)을 불러와 '품번 대조 영역'과 비교")
+        act("대조 결과", self.show_bulk_report, "Ctrl+R", "엑셀 품번 하나하나가 PDF에 있는지, 가격이 맞는지")
         tb.addSeparator()
         act("글자 인식(OCR)", self.run_ocr_all, tip="모든 쪽을 OCR로 다시 읽기 "
             "(글자가 깨져 읽히거나, 일부만 이미지인 PDF에 사용)")
@@ -151,6 +159,13 @@ class MainWindow(QMainWindow):
         self.p_kind = QComboBox()
         self.p_kind.addItem("숫자 변경", VALUE)
         self.p_kind.addItem("지우기", ERASE)
+        self.p_kind.addItem("품번 대조 (엑셀)", LIST)
+        self.p_list_unmatched = QComboBox()
+        self.p_list_unmatched.addItem("엑셀에 없는 품번 줄은 지우기", "erase")
+        self.p_list_unmatched.addItem("표시만 하고 지우지 않기", "keep")
+        self.p_list_price = QComboBox()
+        self.p_list_price.addItem("가격이 다르면 엑셀 가격으로 바꾸기", "replace")
+        self.p_list_price.addItem("가격이 달라도 표시만 하기", "check")
         self.p_erase_mode = QComboBox()
         self.p_erase_mode.addItem("글자 골라 지우기 (남길 글자 선택)", ERASE_PICK)
         self.p_erase_mode.addItem("영역 전체 덮기 (도장·이미지 포함)", ERASE_ALL)
@@ -240,6 +255,8 @@ class MainWindow(QMainWindow):
         form.addRow("종류", self.p_kind)
         form.addRow("지우는 방식", self.p_erase_mode)
         form.addRow("다른 문서에서", self.p_unknown)
+        form.addRow("엑셀에 없는 품번", self.p_list_unmatched)
+        form.addRow("가격 비교", self.p_list_price)
         form.addRow("", self.p_number_only)
         form.addRow(self._formula_label, self.p_formula)
         self.p_fmt_row_widget, self.p_align_row_widget, self.p_font_row_widget = QWidget(), QWidget(), QWidget()
@@ -258,7 +275,8 @@ class MainWindow(QMainWindow):
 
         for w in (self.p_name, self.p_formula, self.p_prefix, self.p_suffix):
             w.editingFinished.connect(self.on_props_edited)
-        for w in (self.p_kind, self.p_align, self.p_fill, self.p_erase_mode, self.p_unknown):
+        for w in (self.p_kind, self.p_align, self.p_fill, self.p_erase_mode, self.p_unknown,
+                  self.p_list_unmatched, self.p_list_price):
             w.currentIndexChanged.connect(self.on_props_edited)
         self.p_number_only.toggled.connect(self.on_props_edited)
         self.p_decimals.valueChanged.connect(self.on_props_edited)
@@ -294,6 +312,8 @@ class MainWindow(QMainWindow):
                 self.open_pdf(p)
             elif ext == ".json":
                 self.open_template(p)
+            elif ext in (".xlsx", ".xlsm", ".csv", ".xls"):
+                self.load_excel(p)
 
     def open_pdf_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "PDF 열기", self.last_dir, "PDF (*.pdf)")
@@ -376,6 +396,7 @@ class MainWindow(QMainWindow):
             ids = self.view.selected_ids()
             self.recompute()
             self.load_props(self.template.region(ids[0]) if ids else None)
+            self._report_bulk_issues()
 
         job.pageDone.connect(on_page)
         job.finished.connect(on_finished)
@@ -386,6 +407,66 @@ class MainWindow(QMainWindow):
         if self._ocr_job is not None:
             self._ocr_job.cancel()
             self._ocr_job = None
+
+    # ───────────────────────── 엑셀 품번 목록 ─────────────────────────
+    def open_excel_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "엑셀 품번 목록 열기", self.last_dir,
+                                              "엑셀/CSV (*.xlsx *.xlsm *.csv)")
+        if path:
+            self.load_excel(path)
+
+    def load_excel(self, path: str) -> None:
+        try:
+            rows = read_table(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, APP_TITLE, f"엑셀을 읽을 수 없습니다.\n{e}")
+            return
+        if not rows:
+            QMessageBox.warning(self, APP_TITLE, "엑셀에 내용이 없습니다.")
+            return
+        dlg = ExcelImportDialog(rows, path, self)
+        if dlg.exec() != ExcelImportDialog.Accepted:
+            return
+        bulk = dlg.result_list()
+        if not bulk.items:
+            QMessageBox.warning(self, APP_TITLE, "품번을 하나도 찾지 못했습니다. 품번 열을 확인하세요.")
+            return
+        self.bulk = bulk
+        self.last_dir = os.path.dirname(path)
+        priced = sum(1 for it in bulk.items.values() if it.price is not None)
+        self.add_message(f"엑셀 불러옴: {os.path.basename(path)} — 품번 {len(bulk.items)}개 (가격 {priced}개)",
+                         OK_COLOR)
+        if not any(r.kind == LIST for r in self.template.regions):
+            self.add_message("이제 '＋ 품번 대조 영역'(L)으로 PDF의 품목 표를 드래그하세요.", WARN_COLOR)
+        ids = self.view.selected_ids()
+        self.recompute()
+        self.load_props(self.template.region(ids[0]) if ids else None)
+        self.update_title()
+        self._report_bulk_issues()
+
+    def _report_bulk_issues(self) -> None:
+        if not self.bulk or not any(r.kind == LIST for r in self.template.regions):
+            return
+        rows = bulk_report(self.template, self.results, self.bulk)
+        missing = [x.key for x in rows if x.level == "err"]
+        warn = sum(1 for x in rows if x.level == "warn")
+        if missing:
+            shown = ", ".join(missing[:8]) + (" 외" if len(missing) > 8 else "")
+            self.add_message(f"엑셀 품번 중 PDF에서 찾지 못한 것 {len(missing)}개: {shown}", ERR_COLOR)
+        if warn:
+            self.add_message(f"엑셀 대조에서 확인이 필요한 항목 {warn}개 — '대조 결과'(Ctrl+R)에서 보세요.", WARN_COLOR)
+        if not missing and not warn:
+            self.add_message("엑셀 품번이 모두 PDF에 있고 문제가 없습니다.", OK_COLOR)
+
+    def show_bulk_report(self) -> None:
+        if not self.bulk:
+            QMessageBox.information(self, APP_TITLE, "먼저 '엑셀 품번 불러오기'로 엑셀을 불러오세요.")
+            return
+        if not any(r.kind == LIST for r in self.template.regions):
+            QMessageBox.information(self, APP_TITLE, "'＋ 품번 대조 영역'으로 PDF의 품목 표를 먼저 지정하세요.")
+            return
+        base = os.path.splitext(self.doc_path)[0] if self.doc_path else os.path.join(self.last_dir, "대조결과")
+        BulkReportDialog(bulk_report(self.template, self.results, self.bulk), base + "_엑셀대조.csv", self).exec()
 
     def run_ocr_all(self) -> None:
         if self.doc:
@@ -499,6 +580,17 @@ class MainWindow(QMainWindow):
         summary = (f"저장 완료: {os.path.basename(path)}\n변경 {changed}곳, "
                    f"자동 검증 {len(checks) - len(failed)}/{len(checks)} 통과\n"
                    f"변경 내역: {os.path.basename(log_path)}")
+        if self.bulk and any(r.kind == LIST for r in self.template.regions):
+            rows = bulk_report(self.template, self.results, self.bulk)
+            report_path = os.path.splitext(path)[0] + "_엑셀대조.csv"
+            try:
+                write_bulk_report(report_path, rows)
+                summary += f"\n엑셀 대조 결과: {os.path.basename(report_path)}"
+            except Exception as e:  # noqa: BLE001
+                summary += f"\n엑셀 대조 결과를 저장하지 못했습니다: {e}"
+            issues = sum(1 for x in rows if x.level in ("warn", "err"))
+            if issues:
+                summary += f"\n\n엑셀 대조에서 확인이 필요한 항목이 {issues}개 있습니다. '대조 결과'를 보세요."
         if failed:
             QMessageBox.warning(self, APP_TITLE, summary + "\n\n검증에 실패한 영역이 있습니다. 확인 메시지를 보세요.")
         else:
@@ -516,7 +608,7 @@ class MainWindow(QMainWindow):
         self.messages.addItem(item)
 
     def recompute(self) -> None:
-        self.results = compute(self.doc, self.template, self.inputs, self.ocr) if self.doc else {}
+        self.results = compute(self.doc, self.template, self.inputs, self.ocr, self.bulk) if self.doc else {}
         self.preview_doc = None
         self.fill_table()
         self.render_page()
@@ -539,7 +631,14 @@ class MainWindow(QMainWindow):
         for row, r in enumerate(self.template.regions):
             res = self.results.get(r.id)
             editable_input = r.kind == VALUE and not r.formula.strip()
-            if r.kind == ERASE:
+            if r.kind == LIST:
+                if res and res.rows and not res.error:
+                    sm = list_summary(res)
+                    result_text = (f"유지 {sm['유지']} · 삭제 {sm['삭제']} · 가격수정 {sm['가격수정']}"
+                                   + (f" · 확인 {sm['확인']}" if sm["확인"] else ""))
+                else:
+                    result_text = ""
+            elif r.kind == ERASE:
                 if r.erase_mode != ERASE_PICK:
                     result_text = "(영역 전체 삭제)"
                 elif res and not res.changed:
@@ -562,9 +661,11 @@ class MainWindow(QMainWindow):
             else:
                 status, color = "유지", QColor("#57606A")
             cells = [
-                (str(r.page + 1), False), ("지우기" if r.kind == ERASE else "숫자", False),
+                (str(r.page + 1), False), ({ERASE: "지우기", LIST: "품번대조"}.get(r.kind, "숫자"), False),
                 (r.name, True), (res.original.text if res else "", False),
-                (self.inputs.get(r.id, "") if editable_input else ("=" + r.formula if r.formula else ""),
+                (self.inputs.get(r.id, "") if editable_input else
+                 ("=" + r.formula if r.formula else
+                  ((f"엑셀 {len(self.bulk.items)}개" if self.bulk else "엑셀 없음") if r.kind == LIST else "")),
                  editable_input),
                 (result_text, False), (status, False),
             ]
@@ -635,6 +736,8 @@ class MainWindow(QMainWindow):
         if self.doc_path:
             parts.append(os.path.basename(self.doc_path))
         parts.append("템플릿: " + (os.path.basename(self.template_path) if self.template_path else "(저장 안 됨)"))
+        if self.bulk:
+            parts.append(f"엑셀: {os.path.basename(self.bulk.source)} ({len(self.bulk.items)}개)")
         self.setWindowTitle(" — ".join(parts))
 
     # ───────────────────────── 영역 편집 ─────────────────────────
@@ -646,6 +749,12 @@ class MainWindow(QMainWindow):
         if kind == ERASE:
             region.name = self.template.next_name("삭제")
             self._default_erase_mode(region, info)
+        elif kind == LIST:
+            region.name = self.template.next_name("품번")
+            region.align = "right"
+            if not self.bulk:
+                self.add_message("품번 대조 영역을 만들었습니다. '엑셀 품번 불러오기'로 엑셀을 불러오면 대조합니다.",
+                                 WARN_COLOR)
         else:
             region.name = self.template.next_name("값")
             self._default_value_style(region, info)
@@ -653,6 +762,8 @@ class MainWindow(QMainWindow):
         self.recompute()
         self.view.select_ids([region.id])
         self.on_view_selection([region.id])
+        if kind == LIST:
+            self._report_bulk_issues()
         if kind == VALUE:
             self.p_name.setFocus()
             self.p_name.selectAll()
@@ -768,7 +879,9 @@ class MainWindow(QMainWindow):
             self.p_thousands.setChecked(region.thousands)
             self.p_align.setCurrentIndex(self.p_align.findData(region.align))
             self.p_size.setValue(region.font_size)
-            if region.kind == VALUE:
+            self.p_list_unmatched.setCurrentIndex(self.p_list_unmatched.findData(region.list_unmatched))
+            self.p_list_price.setCurrentIndex(self.p_list_price.findData(region.list_price))
+            if region.kind in (VALUE, LIST):
                 self._load_font_choices()
                 idx = self.p_font.findData(region.font)
                 if idx < 0 and region.font:          # 이 PC에 없는 글꼴이 지정된 템플릿
@@ -778,11 +891,15 @@ class MainWindow(QMainWindow):
                 self._show_style(region)
             self._set_fill_options(region.fill)
             is_value = region.kind == VALUE
+            is_list = region.kind == LIST
             pick = region.kind == ERASE and region.erase_mode == ERASE_PICK
-            for w in (self.p_number_only, self.p_formula, self.p_fmt_row_widget, self.p_align_row_widget,
-                      self.p_style_label, self.p_font_row_widget):
+            for w in (self.p_number_only, self.p_formula, self.p_fmt_row_widget):
                 self.form.setRowVisible(w, is_value)
-            self.form.setRowVisible(self.p_erase_mode, not is_value)
+            for w in (self.p_align_row_widget, self.p_style_label, self.p_font_row_widget):
+                self.form.setRowVisible(w, is_value or is_list)
+            for w in (self.p_list_unmatched, self.p_list_price):
+                self.form.setRowVisible(w, is_list)
+            self.form.setRowVisible(self.p_erase_mode, region.kind == ERASE)
             self.form.setRowVisible(self.p_unknown, pick)
             for b in (self.p_all_erase, self.p_all_keep):
                 b.setVisible(pick)
@@ -799,6 +916,20 @@ class MainWindow(QMainWindow):
         if not res:
             return []
         words = res.original.words
+        if region.kind == LIST:
+            out: list = [None] * len(words)
+            edit_text = {e.word: e.text for e in res.edits}
+            for row in res.rows:
+                for i, w in enumerate(words):
+                    if w.line != row.line:
+                        continue
+                    if res.erase_flags and res.erase_flags[i]:
+                        out[i] = ("erase", row.action)
+                    elif i in edit_text:
+                        out[i] = ("target", f"가격 → {edit_text[i]}")
+                    elif row.key and w.text == row.key:
+                        out[i] = ("keep", row.action)
+            return out
         if region.kind == ERASE:
             if region.erase_mode == ERASE_PICK:
                 return [("erase", "지움") if e else ("keep", "남김") for e in res.erase_flags]
@@ -814,7 +945,45 @@ class MainWindow(QMainWindow):
                 out.append(("keep", "유지"))
         return out
 
+    def _fill_rows(self, region: Region) -> None:
+        """품번 대조 영역: 줄마다 판정 결과를 보여 준다."""
+        res = self.results.get(region.id)
+        self.p_words.blockSignals(True)
+        self.p_words.clear()
+        if not self.bulk:
+            self.p_words_label.setText("'엑셀 품번 불러오기'로 품번·가격 엑셀을 먼저 불러오세요.")
+        elif not res or not res.rows:
+            self.p_words_label.setText("영역 안에서 읽은 글자가 없습니다.")
+        else:
+            self.p_words_label.setText("줄마다 엑셀과 대조한 결과입니다. 빨강 = 지움, 파랑 = 가격 바꿈, "
+                                       "주황 = 확인 필요. PDF 위에도 같은 색으로 표시됩니다.")
+            for row in res.rows:
+                if row.status == "unmatched" and "삭제" in row.action:
+                    color, icon = ERR_COLOR, "✖"
+                elif row.status == "similar" or row.price_status == "unknown" or (
+                        row.price_status == "diff" and region.list_price != "replace"):
+                    color, icon = WARN_COLOR, "⚠"
+                elif row.price_status == "diff":
+                    color, icon = QColor("#0B5CD5"), "✎"
+                elif row.status == "matched":
+                    color, icon = OK_COLOR, "✔"
+                else:
+                    color, icon = QColor("#57606A"), "·"
+                item = QListWidgetItem(f"{icon} {row.line + 1}줄  {row.text}    — {row.action}")
+                item.setToolTip(row.note or row.action)
+                item.setForeground(QBrush(color))
+                if row.status == "unmatched" and "삭제" in row.action:
+                    f = QFont()
+                    f.setStrikeOut(True)
+                    item.setFont(f)
+                item.setFlags(Qt.ItemIsEnabled)
+                self.p_words.addItem(item)
+        self.p_words.blockSignals(False)
+
     def _fill_words(self, region: Region) -> None:
+        if region.kind == LIST:
+            self._fill_rows(region)
+            return
         res = self.results.get(region.id)
         words = res.original.words if res else []
         states = self._word_states(region)
@@ -860,8 +1029,8 @@ class MainWindow(QMainWindow):
             self.view.set_marks([], False)
             return
         words = self.results[region.id].original.words
-        marks = [(list(w.bbox), state, f"{w.text}: {desc}")
-                 for w, (state, desc) in zip(words, self._word_states(region))]
+        marks = [(list(w.bbox), sd[0], f"{w.text}: {sd[1]}")
+                 for w, sd in zip(words, self._word_states(region)) if sd is not None]
         self.view.set_marks(marks, region.kind == ERASE and region.erase_mode == ERASE_PICK)
 
     def _toggle_word(self, index: int, erase: bool) -> None:
@@ -903,7 +1072,8 @@ class MainWindow(QMainWindow):
         if self._syncing or region is None:
             return
         fields_ = ("name", "kind", "formula", "prefix", "suffix", "decimals", "thousands", "align",
-                   "font_size", "fill", "erase_mode", "unknown_action", "number_only", "font")
+                   "font_size", "fill", "erase_mode", "unknown_action", "number_only", "font",
+                   "list_unmatched", "list_price")
         before = tuple(getattr(region, f) for f in fields_)
         region.name = self.p_name.text().strip() or region.name
         new_kind = self.p_kind.currentData()
@@ -930,8 +1100,10 @@ class MainWindow(QMainWindow):
         region.thousands = self.p_thousands.isChecked()
         region.align = self.p_align.currentData()
         region.font_size = self.p_size.value()
-        if region.kind == VALUE and self._fonts_loaded:
+        if region.kind in (VALUE, LIST) and self._fonts_loaded:
             region.font = self.p_font.currentData() or ""
+        region.list_unmatched = self.p_list_unmatched.currentData()
+        region.list_price = self.p_list_price.currentData()
         if tuple(getattr(region, f) for f in fields_) != before:
             QTimer.singleShot(0, self._after_edit)
 
@@ -949,17 +1121,24 @@ class MainWindow(QMainWindow):
     def _detected_style(self, region: Region):
         """사용자 지정값을 빼고, 원본에서 자동으로 알아낸 서식."""
         res = self.results.get(region.id)
-        if not self.doc or not res or res.error or region.kind != VALUE or not res.original.words:
+        if not self.doc or not res or res.error or region.kind not in (VALUE, LIST) or not res.original.words:
+            return None
+        if region.kind == LIST and not res.edits:
             return None
         probe = dataclasses.replace(region, font="", font_size=0, color="")
         try:
+            if region.kind == LIST:
+                e = res.edits[0]
+                return word_style(self.doc, probe, res.original.words, e.word, e.text, self.ocr)
             return region_style(self.doc, probe, res, self.ocr)
         except Exception:  # noqa: BLE001
             return None
 
     def _show_style(self, region: Region) -> None:
         style = self._detected_style(region)
-        if style is None:
+        if style is None and region.kind == LIST:
+            self.p_style_label.setText("가격을 바꿀 줄이 생기면 그 글자의 글꼴·크기·색이 표시됩니다.")
+        elif style is None:
             self.p_style_label.setText("영역 안 글자를 읽으면 원본의 글꼴·크기·색이 표시됩니다.")
         else:
             self.p_style_label.setText("감지: " + style.describe())
@@ -977,7 +1156,7 @@ class MainWindow(QMainWindow):
 
     def pick_text_color(self) -> None:
         region = getattr(self, "_current", None)
-        if region is None or region.kind != VALUE:
+        if region is None or region.kind not in (VALUE, LIST):
             return
         style = self._detected_style(region)
         start = region.color or ("#%02X%02X%02X" % tuple(round(c * 255) for c in style.color) if style else "#000000")

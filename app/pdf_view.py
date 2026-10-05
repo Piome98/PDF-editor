@@ -13,8 +13,9 @@ from PySide6.QtWidgets import (QGraphicsItem, QGraphicsPixmapItem, QGraphicsRect
 
 from core.models import ERASE, Region
 
-MODE_SELECT, MODE_ERASE, MODE_VALUE = "select", "erase", "value"
-COLORS = {ERASE: QColor("#E5484D"), "value": QColor("#2F6FEB")}
+MODE_SELECT, MODE_ERASE, MODE_VALUE, MODE_LIST = "select", "erase", "value", "list"
+COLORS = {ERASE: QColor("#E5484D"), "value": QColor("#2F6FEB"), "list": QColor("#8250DF")}
+_MODE_KIND = {MODE_ERASE: ERASE, MODE_VALUE: "value", MODE_LIST: "list"}
 HANDLE_PX = 8
 
 
@@ -271,7 +272,7 @@ class PdfView(QGraphicsView):
         if self.mode != MODE_SELECT and event.button() == Qt.LeftButton and not self.page_rect.isEmpty():
             self._draw_start = self.mapToScene(event.position().toPoint())
             self._rubber = QGraphicsRectItem()
-            pen = QPen(COLORS[ERASE if self.mode == MODE_ERASE else "value"], 1.5, Qt.DashLine)
+            pen = QPen(COLORS[_MODE_KIND[self.mode]], 1.5, Qt.DashLine)
             pen.setCosmetic(True)
             self._rubber.setPen(pen)
             self.scene().addItem(self._rubber)
@@ -291,7 +292,7 @@ class PdfView(QGraphicsView):
             self.scene().removeItem(self._rubber)
             self._rubber, self._draw_start = None, None
             if r.width() >= 4 and r.height() >= 4:
-                kind = ERASE if self.mode == MODE_ERASE else "value"
+                kind = _MODE_KIND[self.mode]
                 self.regionDrawn.emit(kind, [round(r.left(), 2), round(r.top(), 2),
                                              round(r.right(), 2), round(r.bottom(), 2)])
             return

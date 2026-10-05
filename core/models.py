@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, fields
 
 ERASE = "erase"   # 영역 안의 내용을 지움
 VALUE = "value"   # 영역 안의 숫자를 새 값으로 교체
+LIST = "list"     # 엑셀 품번 목록과 대조: 엑셀에 있는 품번 줄은 남기고, 없는 품번 줄은 지움
 
 ERASE_ALL = "all"     # 지우기 영역: 영역 전체를 덮음 (글자·도장 이미지 등 모두)
 ERASE_PICK = "pick"   # 지우기 영역: 영역 안의 글자 중 고른 단어만 지움
@@ -38,6 +39,9 @@ class Region:
     keep_texts: list[str] = field(default_factory=list)    # 이 글자는 남김
     erase_texts: list[str] = field(default_factory=list)   # 이 글자는 지움
     unknown_action: str = "erase"                           # 규칙에 없는 글자: "erase" | "keep"
+    # 품번 대조 영역
+    list_unmatched: str = "erase"                           # 엑셀에 없는 품번 줄: "erase"(줄 삭제) | "keep"(표시만)
+    list_price: str = "replace"                             # 가격이 다르면: "replace"(엑셀 가격으로) | "check"(표시만)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def should_erase(self, word: str) -> bool:

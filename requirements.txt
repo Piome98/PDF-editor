@@ -5,3 +5,4 @@ pytest
 rapidocr>=3.9
 onnxruntime>=1.20
 fonttools>=4.50
+openpyxl>=3.1

@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import csv
 import math
+import re
+import statistics
 from dataclasses import dataclass, field
 from decimal import Decimal
 
 import pymupdf
 
 from . import fonts
+from .bulk import BulkItem, BulkList, norm_key
 from .fonts import TextStyle
 from .formula import FormulaError, evaluate, expand_wildcards, is_valid_name
-from .models import ERASE, ERASE_PICK, VALUE, Region, Template
-from .numbers import format_number, parse_number
+from .models import ERASE, ERASE_PICK, LIST, VALUE, Region, Template
+from .numbers import detect_style, format_number, parse_number
 from .words import Word, order_words, words_in_rect
 
 OcrMap = dict[int, list[Word]]   # 쪽 번호 → OCR로 읽은 단어 (OCR한 쪽만 들어 있음)
@@ -109,6 +112,29 @@ def number_target(region: Region, words: list[Word]) -> int | None:
 # ───────────────────────── 계산 ─────────────────────────
 
 @dataclass
+class Edit:
+    """영역 안의 단어 하나를 새 글자로 바꾸기."""
+    word: int | None          # 바꿀 단어 번호 (None = 영역 전체에 새로 씀)
+    text: str
+    style: TextStyle | None = None
+
+
+@dataclass
+class RowCheck:
+    """품번 대조 영역의 줄 하나에 대한 판정."""
+    line: int
+    text: str                       # 줄 전체 글자
+    key: str = ""                   # PDF에서 찾은 품번 단어
+    status: str = "other"           # matched(엑셀에 있음) | similar(비슷함) | unmatched(엑셀에 없음) | other(품번 없는 줄)
+    item: BulkItem | None = None
+    note: str = ""
+    pdf_price: str = ""
+    price_status: str = ""          # ok | diff | unknown(가격 위치 모름) | none(엑셀에 가격 없음)
+    new_price: str = ""
+    action: str = ""                # 화면 표시용 조치
+
+
+@dataclass
 class RegionResult:
     region_id: str
     original: TextInfo = field(default_factory=TextInfo)
@@ -119,6 +145,8 @@ class RegionResult:
     target: int | None = None                           # 숫자 영역: 교체할 단어 번호
     erase_flags: list[bool] = field(default_factory=list)  # 지우기 영역: 단어별 지움 여부
     style: TextStyle | None = None                      # 숫자 영역: 새 글자를 쓸 글꼴·크기·색
+    edits: list[Edit] = field(default_factory=list)       # 품번 대조 영역: 가격 바꾸기
+    rows: list[RowCheck] = field(default_factory=list)     # 품번 대조 영역: 줄별 판정
 
     @property
     def base_text(self) -> str:
@@ -160,7 +188,7 @@ def check_template(doc: pymupdf.Document, tpl: Template, ocr: OcrMap | None = No
 
 
 def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str],
-            ocr: OcrMap | None = None) -> dict[str, RegionResult]:
+            ocr: OcrMap | None = None, bulk: BulkList | None = None) -> dict[str, RegionResult]:
     """각 영역의 새 값을 계산한다. inputs는 {영역 id: 사용자가 입력한 값}."""
     results: dict[str, RegionResult] = {}
     for r in tpl.regions:
@@ -216,6 +244,12 @@ def compute(doc: pymupdf.Document, tpl: Template, inputs: dict[str, str],
         if r.kind == ERASE:
             res.changed = any(res.erase_flags) if r.erase_mode == ERASE_PICK else True
             continue
+        if r.kind == LIST:
+            if bulk is None or not bulk.items:
+                res.error = "엑셀 품번 목록을 먼저 불러오세요"
+            else:
+                _compute_list(doc, r, res, bulk, ocr)
+            continue
         if not is_valid_name(r.name):
             res.error = "이름은 공백 없이 한글/영문/숫자/_로 지어야 하며 숫자로 시작할 수 없습니다"
             continue
@@ -239,35 +273,169 @@ def _norm(s: str) -> str:
     return "".join(s.split())
 
 
+_DATE = re.compile(r"^\d{2,4}[./-]\d{1,2}[./-]\d{1,2}\.?$")
+
+
+def _is_amount(text: str) -> bool:
+    """가격 후보 단어: 숫자이면서 날짜·백분율이 아닌 것."""
+    return (any(c.isdigit() for c in text) and parse_number(text) is not None
+            and not _DATE.match(text) and not text.endswith("%"))
+
+
+def _cx(w: Word) -> float:
+    return (w.bbox[0] + w.bbox[2]) / 2
+
+
+def _compute_list(doc: pymupdf.Document, r: Region, res: RegionResult, bulk: BulkList,
+                  ocr: OcrMap | None) -> None:
+    words = res.original.words
+    lines: dict[int, list[int]] = {}
+    for i, w in enumerate(words):
+        lines.setdefault(w.line, []).append(i)
+    matches = {i: bulk.match(w.text) for i, w in enumerate(words)}
+
+    def key_of(idxs):
+        cands = [(i, matches[i]) for i in idxs if matches[i]]
+        exact = [c for c in cands if c[1].kind == "exact"]
+        return exact[0] if exact else (cands[0] if cands else None)
+
+    # 엑셀과 정확히 맞은 줄들로 '품번 열'과 '가격 열'의 위치를 배운다
+    key_xs, price_x1s = [], []
+    for idxs in lines.values():
+        pick = key_of(idxs)
+        if not pick or pick[1].kind != "exact":
+            continue
+        key_xs.append(_cx(words[pick[0]]))
+        price = pick[1].item.price
+        if price is not None:
+            price_x1s += [words[j].bbox[2] for j in idxs
+                          if j != pick[0] and _is_amount(words[j].text) and parse_number(words[j].text) == price]
+    key_x = statistics.median(key_xs) if key_xs else None
+    price_x = statistics.median(price_x1s) if price_x1s else None
+    tol = max(15.0, (r.rect[2] - r.rect[0]) * 0.06)
+
+    erase = [False] * len(words)
+    edits: list[Edit] = []
+    rows: list[RowCheck] = []
+    for line, idxs in sorted(lines.items()):
+        row = RowCheck(line, " ".join(words[i].text for i in idxs))
+        rows.append(row)
+        pick = key_of(idxs)
+        if pick is None:
+            keyish = [i for i in idxs if bulk.looks_like_key(words[i].text)
+                      or (key_x is not None and abs(_cx(words[i]) - key_x) <= tol and len(norm_key(words[i].text)) >= 4
+                          and not _DATE.match(words[i].text))]
+            if keyish:
+                row.key, row.status = words[keyish[0]].text, "unmatched"
+                if r.list_unmatched == "erase":
+                    for i in idxs:
+                        erase[i] = True
+                    row.action = "엑셀에 없음 → 줄 삭제"
+                else:
+                    row.action = "엑셀에 없음 (표시만)"
+            else:
+                row.action = "품번 없는 줄 → 유지"
+            continue
+
+        ki, m = pick
+        row.key, row.item, row.note = words[ki].text, m.item, m.note
+        row.status = "matched" if m.kind == "exact" else "similar"
+        if m.item.price is None:
+            row.price_status = "none"
+        else:
+            amounts = [j for j in idxs if j != ki and _is_amount(words[j].text)]
+            equal = [j for j in amounts if parse_number(words[j].text) == m.item.price]
+            if equal:
+                row.pdf_price, row.price_status = words[equal[0]].text, "ok"
+            else:
+                pj = None
+                if price_x is not None and amounts:
+                    pj = min(amounts, key=lambda j: abs(words[j].bbox[2] - price_x))
+                    if abs(words[pj].bbox[2] - price_x) > tol:
+                        pj = None
+                elif len(amounts) == 1:
+                    pj = amounts[0]
+                if pj is None:
+                    row.price_status = "unknown"
+                else:
+                    row.pdf_price, row.price_status = words[pj].text, "diff"
+                    st = detect_style(words[pj].text)
+                    exp = m.item.price.as_tuple().exponent
+                    decimals = max(st.decimals, -exp if isinstance(exp, int) and exp < 0 else 0)
+                    row.new_price = format_number(m.item.price, decimals, st.thousands, st.prefix, st.suffix)
+                    if r.list_price == "replace" and row.status == "matched":
+                        edits.append(Edit(pj, row.new_price))
+        if row.status == "similar":
+            row.action = "비슷한 품번 → 유지, 확인 필요"
+        elif row.price_status == "diff":
+            row.action = (f"가격 {row.pdf_price} → {row.new_price}" if r.list_price == "replace"
+                          else f"가격 다름: PDF {row.pdf_price} / 엑셀 {row.new_price}")
+        elif row.price_status == "unknown":
+            row.action = "엑셀에 있음 → 유지 (가격 위치를 못 찾음, 확인 필요)"
+        elif row.price_status == "ok":
+            row.action = "엑셀에 있음, 가격 일치 → 유지"
+        else:
+            row.action = "엑셀에 있음 → 유지"
+
+    res.erase_flags, res.edits, res.rows = erase, edits, rows
+    res.changed = any(erase) or bool(edits)
+    for e in edits:
+        e.style = word_style(doc, r, words, e.word, e.text, ocr)
+
+
+def list_summary(res: RegionResult) -> dict[str, int]:
+    rows = res.rows
+    return {
+        "유지": sum(1 for x in rows if x.status in ("matched", "similar")),
+        "삭제": sum(1 for x in rows if x.status == "unmatched" and "삭제" in x.action),
+        "가격수정": len(res.edits),
+        "확인": sum(1 for x in rows if x.status == "similar" or x.price_status in ("unknown",)
+                   or (x.price_status == "diff" and not any(e.text == x.new_price for e in res.edits))),
+    }
+
+
+def edits_of(r: Region, res: RegionResult) -> list[Edit]:
+    if r.kind == VALUE:
+        return [Edit(res.target, res.new_text, res.style)]
+    if r.kind == LIST:
+        return res.edits
+    return []
+
+
 def expected_text(r: Region, res: RegionResult) -> str:
     """수정이 끝난 뒤 영역 안에 보여야 할 텍스트."""
     if not res.changed:
         return res.original.text
-    if r.kind == ERASE:
-        return " ".join(w.text for w in res.kept_words()) if r.erase_mode == ERASE_PICK else ""
-    if res.target is None:
+    if r.kind == ERASE and r.erase_mode != ERASE_PICK:
+        return ""
+    if r.kind == VALUE and res.target is None:
         return res.new_text
-    words = [w.text for w in res.original.words]
-    words[res.target] = res.new_text
-    return " ".join(words)
+    new = {e.word: e.text for e in edits_of(r, res)}
+    erase = res.erase_flags or [False] * len(res.original.words)
+    return " ".join(new.get(i, w.text) for i, w in enumerate(res.original.words) if not erase[i])
 
 
 # ───────────────────────── 쓰기 ─────────────────────────
 
-def region_style(doc: pymupdf.Document, r: Region, res: RegionResult, ocr: OcrMap | None = None) -> TextStyle:
-    """숫자 영역의 새 글자를 원본과 같게 쓰기 위한 글꼴·크기·색. 사용자가 정한 값이 있으면 그걸 쓴다."""
-    words = res.original.words
-    ref = words[res.target] if res.target is not None else (words[0] if words else None)
+def word_style(doc: pymupdf.Document, r: Region, words: list[Word], idx: int | None, new_text: str,
+               ocr: OcrMap | None = None) -> TextStyle:
+    """새 글자를 원본과 같게 쓰기 위한 글꼴·크기·색. 사용자가 영역에 정한 값이 있으면 그걸 쓴다."""
+    ref = words[idx] if idx is not None else (words[0] if words else None)
     if ref is None:          # 빈 칸에 새로 쓰는 경우
         face = fonts.find_face(fonts.FALLBACK_FONT)
         rect = pymupdf.Rect(r.rect)
         style = TextStyle(face.label if face else "Helvetica", round(rect.height * 0.6, 1), (0, 0, 0),
                           "fallback", face=face)
     elif ref.ocr:
-        style = fonts.ocr_style(words, ref, (ocr or {}).get(r.page))
+        same_line = [w for w in words if w.line == ref.line]
+        style = fonts.ocr_style(same_line, ref, (ocr or {}).get(r.page))
     else:
-        style = fonts.text_layer_style(doc, doc[r.page], ref, res.new_text or ref.text)
+        style = fonts.text_layer_style(doc, doc[r.page], ref, new_text or ref.text)
     return fonts.apply_overrides(style, r.font, r.font_size, r.color)
+
+
+def region_style(doc: pymupdf.Document, r: Region, res: RegionResult, ocr: OcrMap | None = None) -> TextStyle:
+    return word_style(doc, r, res.original.words, res.target, res.new_text, ocr)
 
 
 def hex_to_rgb(h: str) -> tuple[float, float, float]:
@@ -291,6 +459,9 @@ def redact_rects(r: Region, res: RegionResult, image_page: bool = False
 
     # 이미지 위에서는 채우지 않으면 원래 글자가 그대로 보이므로 흰색으로 덮는다
     whole = (pymupdf.Rect(r.rect), user_fill or ((1, 1, 1) if image_page else None))
+    if r.kind == LIST:
+        targets = {e.word for e in res.edits}
+        return [word_item(w) for i, w in enumerate(res.original.words) if res.erase_flags[i] or i in targets]
     if r.kind == ERASE:
         if r.erase_mode == ERASE_PICK:
             return [word_item(w) for w, e in zip(res.original.words, res.erase_flags) if e]
@@ -321,10 +492,10 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
             images=pymupdf.PDF_REDACT_IMAGE_PIXELS if image_page else pymupdf.PDF_REDACT_IMAGE_NONE,
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
         for r in regions:
-            if r.kind == VALUE:
-                res = results[r.id]
-                style = res.style or region_style(doc, r, res, ocr)
-                _draw_value(page, r, res, style)
+            res = results[r.id]
+            for e in edits_of(r, res):
+                style = e.style or word_style(doc, r, res.original.words, e.word, e.text, ocr)
+                _draw_replacement(page, r, res.original, e.word, e.text, style)
     try:
         out.subset_fonts()       # 넣은 글꼴에서 실제 쓴 글자만 남겨 파일 크기를 줄인다
     except Exception:  # noqa: BLE001
@@ -332,14 +503,13 @@ def apply(doc: pymupdf.Document, tpl: Template, results: dict[str, RegionResult]
     return out
 
 
-def _bounds(r: Region, res: RegionResult, size: float) -> tuple[float, float]:
+def _bounds(rect: pymupdf.Rect, words: list[Word], idx: int | None, size: float) -> tuple[float, float]:
     """새 글자를 쓸 수 있는 가로 범위: 영역 안이면서, 같은 줄에 남겨 둔 글자(라벨·단위)와 겹치지 않는 곳."""
-    rect = pymupdf.Rect(r.rect)
     left, right = rect.x0 + 1, rect.x1 - 1
-    if res.target is not None:
-        target = res.original.words[res.target]
+    if idx is not None:
+        target = words[idx]
         gap = size * 0.25
-        for w in res.original.words:
+        for w in words:
             if w is target or w.line != target.line:
                 continue
             if w.bbox[2] <= target.bbox[0]:
@@ -349,12 +519,11 @@ def _bounds(r: Region, res: RegionResult, size: float) -> tuple[float, float]:
     return left, right
 
 
-def _anchor(r: Region, res: RegionResult, left: float, right: float) -> pymupdf.Rect:
-    if res.target is not None:
-        return pymupdf.Rect(res.original.words[res.target].bbox)
-    if res.original.bbox:
-        return pymupdf.Rect(res.original.bbox)
-    rect = pymupdf.Rect(r.rect)
+def _anchor(rect: pymupdf.Rect, info: TextInfo, idx: int | None, left: float, right: float) -> pymupdf.Rect:
+    if idx is not None:
+        return pymupdf.Rect(info.words[idx].bbox)
+    if info.bbox:
+        return pymupdf.Rect(info.bbox)
     return pymupdf.Rect(left, rect.y0, right, rect.y1)
 
 
@@ -369,14 +538,14 @@ def _place(align: str, anchor: pymupdf.Rect, x0: float, x1: float, left: float, 
     return min(max(x, left - x0), right - x1)
 
 
-def _draw_value(page: pymupdf.Page, r: Region, res: RegionResult, style: TextStyle) -> None:
+def _draw_replacement(page: pymupdf.Page, r: Region, info: TextInfo, idx: int | None, text: str,
+                      style: TextStyle) -> None:
     rect = pymupdf.Rect(r.rect)
-    target = res.original.words[res.target] if res.target is not None else None
+    target = info.words[idx] if idx is not None else None
     size = style.size or rect.height * 0.7
-    left, right = _bounds(r, res, size)
-    anchor = _anchor(r, res, left, right)
-    baseline = target.baseline if target else res.original.baseline
-    text = res.new_text
+    left, right = _bounds(rect, info.words, idx, size)
+    anchor = _anchor(rect, info, idx, left, right)
+    baseline = target.baseline if target else info.baseline
 
     if style.raster_dpi and style.face is not None:
         # 이미지 PDF: 원본과 같은 해상도의 그림으로 넣어 글자 번짐 정도까지 맞춘다
@@ -464,6 +633,9 @@ def verify(out: pymupdf.Document, tpl: Template, results: dict[str, RegionResult
             elif r.kind == ERASE:
                 kept = expected
                 msg = f"삭제됨 (남김: {kept})" if kept else "삭제됨"
+            elif r.kind == LIST:
+                sm = list_summary(res)
+                msg = f"품번 대조 반영됨 (유지 {sm['유지']} · 줄 삭제 {sm['삭제']} · 가격 수정 {sm['가격수정']})"
             else:
                 msg = "변경됨"
         else:
@@ -482,14 +654,73 @@ def write_log(path: str, tpl: Template, results: dict[str, RegionResult], checks
         for r in tpl.regions:
             res, chk = results.get(r.id), by_id.get(r.id)
             erased = ""
-            if res and r.kind == ERASE:
-                erased = (" ".join(wd.text for wd, e in zip(res.original.words, res.erase_flags) if e)
-                          if r.erase_mode == ERASE_PICK else "(영역 전체)")
+            if res and r.kind in (ERASE, LIST) and (r.kind == LIST or r.erase_mode == ERASE_PICK):
+                erased = " ".join(wd.text for wd, e in zip(res.original.words, res.erase_flags) if e)
+            elif res and r.kind == ERASE:
+                erased = "(영역 전체)"
             w.writerow([
-                r.page + 1, r.name, "삭제" if r.kind == ERASE else "값",
+                r.page + 1, r.name, {ERASE: "삭제", LIST: "품번대조"}.get(r.kind, "값"),
                 res.original.text if res else "",
                 expected_text(r, res) if res and not res.error else "",
                 erased,
                 "OK" if chk and chk.ok else "확인 필요",
                 chk.message if chk else "",
             ])
+
+
+# ───────────────────────── 엑셀 대조 결과 ─────────────────────────
+
+@dataclass
+class BulkRow:
+    key: str
+    excel_price: str
+    pdf_key: str
+    pdf_price: str
+    status: str          # 화면·CSV 표시용
+    level: str           # ok(문제없음) | warn(확인 필요) | err(PDF에 없음) | del(엑셀에 없어 지운 줄)
+
+
+def bulk_report(tpl: Template, results: dict[str, RegionResult], bulk: BulkList) -> list[BulkRow]:
+    """엑셀 품번 하나하나가 PDF에 있었는지, 가격이 맞았는지 + PDF에만 있던 품번."""
+    found: dict[str, RowCheck] = {}
+    extra: list[RowCheck] = []
+    for r in tpl.regions:
+        res = results.get(r.id)
+        if r.kind != LIST or res is None:
+            continue
+        for row in res.rows:
+            if row.item is not None:
+                found.setdefault(norm_key(row.item.key), row)
+            elif row.status == "unmatched":
+                extra.append(row)
+    out = []
+    for k, item in bulk.items.items():
+        price = format_number(item.price, 0) if item.price is not None else ""
+        row = found.get(k)
+        if row is None:
+            out.append(BulkRow(item.key, price, "", "", "PDF에 없음", "err"))
+            continue
+        if row.status == "similar":
+            status, level = f"비슷한 품번 — 확인 필요 ({row.note})", "warn"
+        elif row.price_status == "diff":
+            status = "가격 다름 → 엑셀 가격으로 바꿈" if row.new_price and "→" in row.action else "가격 다름 — 확인 필요"
+            level = "warn" if "확인" in status else "ok"
+        elif row.price_status == "unknown":
+            status, level = "PDF에 있음 (가격 위치 못 찾음 — 확인 필요)", "warn"
+        elif row.price_status == "ok":
+            status, level = "PDF에 있음, 가격 일치", "ok"
+        else:
+            status, level = "PDF에 있음", "ok"
+        out.append(BulkRow(item.key, price, row.key, row.pdf_price, status, level))
+    for row in extra:
+        deleted = "삭제" in row.action
+        out.append(BulkRow("", "", row.key, "", row.action, "del" if deleted else "warn"))
+    return out
+
+
+def write_bulk_report(path: str, rows: list[BulkRow]) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["엑셀 품번", "엑셀 가격", "PDF 품번", "PDF 가격", "결과"])
+        for x in rows:
+            w.writerow([x.key, x.excel_price, x.pdf_key, x.pdf_price, x.status])
